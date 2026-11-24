@@ -20,6 +20,12 @@ bash scripts/train.sh
 
 `scripts/train.sh` checks the dataset, writes the train/val split, downloads the pretrained weights, uses every GPU it finds and starts training. If training stops, run the same command again to resume from `runs/<experiment>/last.pt`.
 
+### Windows (e.g. a laptop RTX 3050, 6 GB)
+
+1. Double-click `setup_windows.bat`. It creates `.venv`, installs PyTorch with CUDA 12.4 and the requirements, runs the smoke test and downloads the weights.
+2. Extract `rs19_val.zip` into `data\railsem19`.
+3. Double-click `train_rtx3050.bat` (batch size 2, 640×1024 crops, 40 epochs). Run it again to resume.
+
 ## What gets trained
 
 | Config | Classes | Use |
