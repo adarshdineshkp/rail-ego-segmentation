@@ -29,6 +29,11 @@ def find_pairs(root):
 
 
 def read_rs19_config(root):
+    jc = list(root.rglob("json-classes.json"))
+    if jc:  # masks were drawn by tools/rasterize_rs19_json.py
+        d = json.loads(jc[0].read_text())
+        print(f"  using classes from {jc[0]} (masks rasterized from JSON annotations)")
+        return [l["name"] for l in d["labels"]], [l["color"] for l in d["labels"]]
     cfgs = list(root.rglob("rs19-config.json"))
     if not cfgs:
         print("  [warn] rs19-config.json not found, using built-in class names")

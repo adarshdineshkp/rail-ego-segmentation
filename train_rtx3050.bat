@@ -1,5 +1,5 @@
 @echo off
-REM Train PIDNet-S (rail classes) on a 6 GB RTX 3050. Run again to resume after a stop.
+REM Train PIDNet-S on a 6 GB RTX 3050. Run again to resume after a stop.
 setlocal
 cd /d "%~dp0"
 if not exist .venv\Scripts\activate.bat (
@@ -8,22 +8,34 @@ if not exist .venv\Scripts\activate.bat (
   exit /b 1
 )
 call .venv\Scripts\activate.bat
+if not exist logs mkdir logs
 
 if not exist data\railsem19 (
-  echo RailSem19 not found. Extract rs19_val.zip into %~dp0data\railsem19 first.
+  echo RailSem19 not found. Extract it into %~dp0data\railsem19 first.
   pause
   exit /b 1
 )
+
+REM Copies without dense label maps (jpgs + jsons only): draw masks from the JSON annotations
+set CONFIG=configs/railsem19_pidnet_s_rails.yaml
+if not exist data\railsem19\uint8 (
+  echo No uint8 label maps found - drawing masks from the JSON annotations ^(a few minutes^) ...
+  python tools\rasterize_rs19_json.py --root data/railsem19
+  if errorlevel 1 goto :fail
+)
+if exist data\railsem19\json-classes.json set CONFIG=configs/railsem19_json_pidnet_s.yaml
+
 if not exist data\splits\train.txt (
   python tools\prepare_railsem19.py --root data/railsem19 --out data/splits
   if errorlevel 1 goto :fail
 )
 
-python train.py --config configs/railsem19_pidnet_s_rails.yaml --resume auto ^
+echo Config: %CONFIG%
+python train.py --config %CONFIG% --resume auto ^
   train.batch_size=2 train.lr=0.0025 "data.train.crop_size=[640,1024]" ^
   train.epochs=40 data.num_workers=4
 if errorlevel 1 goto :fail
-echo Training finished. Checkpoints: runs\rs19_pidnet_s_rails\best.pt
+echo Training finished. Checkpoints are in the runs folder.
 pause
 exit /b 0
 

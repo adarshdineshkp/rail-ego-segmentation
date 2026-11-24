@@ -32,6 +32,7 @@ bash scripts/train.sh
 |---|---|---|
 | `configs/railsem19_pidnet_s_rails.yaml` (default) | background, rail, track, trackbed, on-rails, human | rail-focused; best.pt is chosen by rail + track IoU |
 | `configs/railsem19_pidnet_s.yaml` | all 19 RailSem19 classes | full scene understanding |
+| `configs/railsem19_json_pidnet_s.yaml` | background, rail, track, human, on-rails, pole, fence, platform | for copies of RailSem19 without `uint8/` masks; masks drawn from the JSON annotations by `tools/rasterize_rs19_json.py` (`train_rtx3050.bat` does this automatically) |
 | `configs/railsem19_pidnet_m_rails.yaml` | rail-focused, PIDNet-M | more accurate, about 2x slower |
 
 To change the label set, edit `data.groups` in the rails config. Each group lists RailSem19 class names, and the group with an empty list collects every class not listed elsewhere.

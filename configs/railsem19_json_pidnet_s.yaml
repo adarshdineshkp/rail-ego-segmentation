@@ -1,0 +1,11 @@
+# PIDNet-S on masks rasterized from RailSem19's JSON annotations (tools/rasterize_rs19_json.py).
+# Use this when your copy of RailSem19 has jpgs/ + jsons/ but no uint8/ label maps.
+# Classes: background, rail, track, human, on-rails, pole, fence, platform
+_base_: railsem19_pidnet_s.yaml
+experiment: rs19json_pidnet_s
+
+data:
+  label_set: full     # the 8 classes listed in json-classes.json
+
+train:
+  key_classes: [rail, track]
