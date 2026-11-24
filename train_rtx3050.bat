@@ -34,9 +34,10 @@ python tools\prepare_railsem19.py --root data/railsem19 --out data/splits --stat
 if errorlevel 1 goto :fail
 
 echo Config: %CONFIG%
+REM batch 4 uses ~2 GB of the 6 GB; 6 workers keep the GPU fed (each worker uses one CPU core)
 python train.py --config %CONFIG% --resume auto ^
-  train.batch_size=2 train.lr=0.0025 "data.train.crop_size=[640,1024]" ^
-  train.epochs=40 data.num_workers=4
+  train.batch_size=4 train.lr=0.005 "data.train.crop_size=[640,1024]" ^
+  train.epochs=40 data.num_workers=6 train.log_every=100
 if errorlevel 1 goto :fail
 echo Training finished. Checkpoints are in the runs folder.
 pause

@@ -2,7 +2,7 @@
 # the RailSem19 ego-path annotations (rs19_egopath.json, github.com/irtrailenium/train-ego-path-detection,
 # CC BY-NC-SA 4.0). Classes: background, rail, track, human, on-rails, pole, fence, platform, ego-track
 _base_: railsem19_json_pidnet_s.yaml
-experiment: rs19ego_pidnet_s
+experiment: rs19ego_pidnet_s_b4
 
 train:
   key_classes: [rail, ego-track]
