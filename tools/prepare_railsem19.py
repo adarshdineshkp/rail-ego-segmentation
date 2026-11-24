@@ -90,6 +90,9 @@ def main():
         print(f"  [warn] unexpected label values {bad}; they will be treated as ignore")
 
     # block split
+    if args.val_count >= len(stems):
+        args.val_count = max(1, len(stems) // 10)
+        print(f"  [warn] --val-count larger than the dataset; using {args.val_count}")
     n_blocks = (len(stems) + args.block - 1) // args.block
     blocks = [stems[i * args.block:(i + 1) * args.block] for i in range(n_blocks)]
     order = list(range(n_blocks))
