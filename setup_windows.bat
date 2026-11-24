@@ -1,5 +1,5 @@
 @echo off
-REM One-time setup on Windows: virtual env, PyTorch (CUDA 12.4), requirements, smoke test, weights.
+REM One-time setup on Windows: virtual env, PyTorch (CUDA 12.6), requirements, smoke test, weights.
 setlocal
 cd /d "%~dp0"
 
@@ -20,8 +20,8 @@ if not exist .venv (
 call .venv\Scripts\activate.bat || goto :fail
 
 python -m pip install --upgrade pip
-echo Installing PyTorch with CUDA 12.4 (about 2.5 GB download) ...
-python -m pip install torch --index-url https://download.pytorch.org/whl/cu124 || goto :fail
+echo Installing PyTorch with CUDA 12.6 (about 2.5 GB download) ...
+python -m pip install torch --index-url https://download.pytorch.org/whl/cu126 || goto :fail
 python -m pip install -r requirements.txt || goto :fail
 
 python -c "import torch; ok=torch.cuda.is_available(); print('PyTorch', torch.__version__, '| CUDA available:', ok, '|', torch.cuda.get_device_name(0) if ok else 'NO GPU FOUND')"

@@ -22,7 +22,7 @@ bash scripts/train.sh
 
 ### Windows (e.g. a laptop RTX 3050, 6 GB)
 
-1. Double-click `setup_windows.bat`. It creates `.venv`, installs PyTorch with CUDA 12.4 and the requirements, runs the smoke test and downloads the weights.
+1. Double-click `setup_windows.bat`. It creates `.venv`, installs PyTorch with CUDA 12.6 and the requirements, runs the smoke test and downloads the weights.
 2. Extract `rs19_val.zip` into `data\railsem19`.
 3. Double-click `train_rtx3050.bat` (batch size 2, 640×1024 crops, 40 epochs). Run it again to resume.
 
