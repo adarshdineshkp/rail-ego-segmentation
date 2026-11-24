@@ -4,6 +4,7 @@
     python infer.py --ckpt runs/rs19_pidnet_s_rails/best.pt --input frame.jpg --out preds/
     python infer.py --ckpt ... --input frames_dir/ --out preds/
     python infer.py --ckpt ... --input drive.mp4 --out preds/          # writes preds/drive_seg.mp4
+    (Ctrl+C stops early and still saves a playable video of the frames done so far)
 
 For each image it saves <name>_overlay.jpg and <name>_label.png (class ids, for your switch logic).
 """
@@ -50,6 +51,7 @@ def main():
                     help="resize network input (default: native resolution)")
     ap.add_argument("--flip", action="store_true")
     ap.add_argument("--alpha", type=float, default=0.5)
+    ap.add_argument("--max-frames", type=int, default=0, help="stop each video after N frames (0 = all)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -67,18 +69,23 @@ def main():
         w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         dst = out / f"{src.stem}_seg.mp4"
         writer = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         n, t0 = 0, time.time()
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            lab = segment(model, frame, device, args.resize, args.flip)
-            writer.write(overlay(frame, lab, colors, args.alpha, skip))
-            n += 1
-            if n % 100 == 0:
-                print(f"  {n} frames, {n / (time.time() - t0):.1f} fps")
-        cap.release()
-        writer.release()
+        try:
+            while True:
+                ok, frame = cap.read()
+                if not ok or (args.max_frames and n >= args.max_frames):
+                    break
+                lab = segment(model, frame, device, args.resize, args.flip)
+                writer.write(overlay(frame, lab, colors, args.alpha, skip))
+                n += 1
+                if n % 100 == 0:
+                    print(f"  {n}/{total or '?'} frames, {n / (time.time() - t0):.1f} fps")
+        except KeyboardInterrupt:
+            print("  stopped with Ctrl+C - saving what was processed")
+        finally:
+            cap.release()
+            writer.release()  # writes the MP4 index, so a partial video still plays
         print(f"Wrote {dst} ({n} frames)")
         return
 
