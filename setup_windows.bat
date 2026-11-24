@@ -32,7 +32,7 @@ python tools\smoke_test.py || goto :fail
 
 echo.
 echo Downloading pretrained PIDNet-S weights ...
-python tools\download_weights.py --model s
+python tools\convert_mmseg_pidnet.py --model s
 
 echo.
 echo ================================================================

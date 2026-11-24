@@ -62,6 +62,9 @@ def main():
                 dst.unlink()
             print(f"  could not download {rel}. Get it manually from\n  {FOLDER}\n  and save it as {dst}")
     print(f"{ok}/{len(FILES[args.model])} weight files ready.")
+    if not ok:
+        print("The Google Drive links are dead. Use the MMSegmentation mirror instead:\n"
+              f"  python tools/convert_mmseg_pidnet.py --model {args.model}   (Windows: get_weights.bat)")
     sys.exit(0 if ok else 1)
 
 
