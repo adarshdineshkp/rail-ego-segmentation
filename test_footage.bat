@@ -21,7 +21,6 @@ if not exist test_footage (
 )
 
 echo Model: %CKPT%
-(
   for %%F in (test_footage\*.mp4 test_footage\*.avi test_footage\*.mov test_footage\*.mkv) do (
     echo === %%F
     python infer.py --ckpt "%CKPT%" --input "%%F" --out preds
@@ -30,8 +29,6 @@ echo Model: %CKPT%
     echo === images in test_footage
     python infer.py --ckpt "%CKPT%" --input test_footage --out preds
   )
-) > logs\test_footage.log 2>&1
-type logs\test_footage.log
 echo.
-echo Results are in %~dp0preds  (log: logs\test_footage.log)
+echo Results are in %~dp0preds
 pause
