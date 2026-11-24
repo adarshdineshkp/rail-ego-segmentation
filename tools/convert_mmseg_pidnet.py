@@ -10,7 +10,9 @@ tensors of the backbone were filled. Segmentation heads are re-initialised durin
 anyway, so only the backbone is converted.
 """
 import argparse
+import pickle
 import re
+import types
 import sys
 import urllib.request
 from pathlib import Path
@@ -71,6 +73,30 @@ RULES = [
 ]
 
 
+class _Stub:
+    """Stand-in for classes from libraries we don't have (mmengine metadata in the checkpoint)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __setstate__(self, state):
+        pass
+
+
+class _TolerantUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        try:
+            return super().find_class(module, name)
+        except (ModuleNotFoundError, AttributeError):
+            return _Stub
+
+
+tolerant_pickle = types.ModuleType("tolerant_pickle")
+tolerant_pickle.Unpickler = _TolerantUnpickler
+tolerant_pickle.load = lambda f, **kw: _TolerantUnpickler(f, **kw).load()
+tolerant_pickle.__name__ = "tolerant_pickle"
+
+
 def convert_key(k):
     for pat, rep in RULES:
         k = re.sub(pat, rep, k)
@@ -91,7 +117,8 @@ def main():
         urllib.request.urlretrieve(URLS[args.model], src)
     print(f"Source: {src} ({src.stat().st_size / 1e6:.1f} MB)")
 
-    ck = torch.load(src, map_location="cpu", weights_only=False)  # openmmlab.com checkpoint
+    # openmmlab.com checkpoint; its training metadata references mmengine classes, which are stubbed
+    ck = torch.load(src, map_location="cpu", weights_only=False, pickle_module=tolerant_pickle)
     sd = ck.get("state_dict", ck)
 
     model = build_model(f"pidnet_{args.model}", 19)
