@@ -1,0 +1,17 @@
+# PIDNet-S on a rail-focused label set: everything that is not track-related is "background".
+# Group names are yours to choose; the lists refer to RailSem19 class names.
+_base_: railsem19_pidnet_s.yaml
+experiment: rs19_pidnet_s_rails
+
+data:
+  label_set: groups
+  groups:
+    background: []                      # empty list = every class not listed below
+    rail: [rail-raised, rail-embedded]  # the rails themselves (thin structures)
+    track: [rail-track, tram-track]     # track area
+    trackbed: [trackbed]
+    on-rails: [on-rails]                # trains / trams
+    human: [human]
+
+train:
+  key_classes: [rail, track]            # pick best.pt by rail + track IoU

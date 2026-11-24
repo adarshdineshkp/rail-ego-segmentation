@@ -1,0 +1,12 @@
+# Larger PIDNet-M variant of the rail-focused setup (about 2x slower; ~1 mIoU better than S on Cityscapes).
+_base_: railsem19_pidnet_s_rails.yaml
+experiment: rs19_pidnet_m_rails
+
+model:
+  name: pidnet_m
+  pretrained:
+    - pretrained_models/cityscapes/PIDNet_M_Cityscapes_val.pt
+    - pretrained_models/imagenet/PIDNet_M_ImageNet.pth.tar
+
+train:
+  batch_size: 6

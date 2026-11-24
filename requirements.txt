@@ -1,0 +1,8 @@
+# Install PyTorch for your CUDA version first: https://pytorch.org/get-started/locally/
+torch>=2.3
+numpy
+opencv-python-headless
+pyyaml
+gdown          # pretrained weight download
+tensorboard    # optional: training curves
+onnx           # optional: tools/export_onnx.py

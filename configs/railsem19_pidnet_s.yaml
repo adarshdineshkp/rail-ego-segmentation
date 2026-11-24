@@ -1,0 +1,58 @@
+# PIDNet-S on all 19 RailSem19 classes.
+experiment: rs19_pidnet_s_full
+output_dir: runs
+
+data:
+  root: data/railsem19        # where rs19_val.zip was extracted
+  splits_dir: data/splits     # written by tools/prepare_railsem19.py
+  label_set: full             # full | groups (see railsem19_pidnet_s_rails.yaml)
+  groups: null
+  ignore_label: 255
+  num_workers: 8
+  train:
+    scale_range: [0.75, 1.5]  # relative to native 1920x1080; kept >= 0.75 so rails stay a few px wide
+    crop_size: [768, 1024]    # h, w
+    hflip: true
+    color_jitter: 0.25
+  val:
+    resize: null              # null = evaluate at native resolution
+
+model:
+  name: pidnet_s              # pidnet_s | pidnet_m | pidnet_l
+  # Tried in order; Cityscapes weights are the better start for outdoor scenes.
+  pretrained:
+    - pretrained_models/cityscapes/PIDNet_S_Cityscapes_val.pt
+    - pretrained_models/imagenet/PIDNet_S_ImageNet.pth.tar
+  skip_head_weights: true     # re-initialise the classifiers (label set differs from Cityscapes)
+
+loss:
+  ohem: true
+  ohem_thresh: 0.9
+  ohem_min_kept: 131072
+  aux_weight: 0.4
+  main_weight: 1.0
+  boundary_weight: 20.0
+  sb_weight: 1.0
+  sb_thresh: 0.8
+  edge_pad: 6
+  edge_dilate: 4
+
+train:
+  epochs: 100
+  batch_size: 8               # per GPU; PIDNet-S at 768x1024 with AMP fits in ~16 GB
+  lr: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005
+  poly_power: 0.9
+  warmup_iters: 1000
+  amp: true
+  sync_bn: true               # multi-GPU only
+  seed: 304
+  eval_every: 5               # epochs
+  log_every: 50               # iterations
+  max_iters: null             # cap total iterations (smoke tests)
+  key_classes: null           # class names; if set, best.pt is chosen by their mean IoU
+
+eval:
+  batch_size: 1
+  flip_test: false
