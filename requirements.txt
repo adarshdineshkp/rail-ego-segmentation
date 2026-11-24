@@ -1,7 +1,7 @@
 # Install PyTorch for your CUDA version first: https://pytorch.org/get-started/locally/
 torch>=2.3
 numpy
-opencv-python-headless
+opencv-python  # with display support (infer.py --show)
 pyyaml
 gdown          # pretrained weight download
 tensorboard    # optional: training curves
