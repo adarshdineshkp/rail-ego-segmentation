@@ -1,9 +1,9 @@
 __pycache__/
 *.pyc
-data/
-runs/
-preds/
-pretrained_models/
+/data/
+/runs/
+/preds/
+/pretrained_models/
 *.pt
 *.pth
 *.pth.tar
