@@ -6,7 +6,12 @@ without the dense `uint8` label maps (e.g. the Mendeley mirror: only jpgs/ + jso
 
 Writes <root>/uint8/<frame>.png and <root>/json-classes.json. Classes:
   0 background  1 rail  2 track (area between a rail pair)  3 human  4 on-rails (train cars)
-  5 pole  6 fence  7 platform          255 = ignore (rail occluders, guard rails)
+  5 pole  6 fence  7 platform  [8 ego-track]   255 = ignore (rail occluders, guard rails)
+
+If <root>/rs19_egopath.json is present (ego-path annotations from
+github.com/irtrailenium/train-ego-path-detection, CC BY-NC-SA 4.0), the train's own path is
+drawn as class 8 "ego-track". Frames that file has no entry for get their track pixels set to
+ignore, since we can't tell which track is the ego one there.
 
 Rails come from 'polyline-pair' / 'polyline' annotations. They are drawn with a width that
 scales with the local track gauge in the image, so they get thinner towards the horizon.
@@ -30,6 +35,7 @@ CLASSES = [
     ("platform", [70, 130, 70]),
 ]
 ID = {n: i for i, (n, _) in enumerate(CLASSES)}
+EGO_ID = len(CLASSES)
 IGNORE = 255
 RAIL_WIDTH_FRAC = 0.06   # rail head width relative to the gauge (~70 mm / 1435 mm, plus margin)
 
@@ -63,7 +69,16 @@ def _fallback_widths(pts, h):
     return np.clip(np.round(2 + 14 * np.clip((y - 0.45) / 0.55, 0, 1)), 2, 16)
 
 
-def rasterize(ann):
+EGO_FILE = "rs19_egopath.json"
+
+
+def class_list(with_ego):
+    return CLASSES + ([("ego-track", [0, 220, 120])] if with_ego else [])
+
+
+def rasterize(ann, ego=None, ego_known=False):
+    """ego: {"left_rail": [[x,y]...], "right_rail": [...]} for this frame, or None.
+    ego_known: an ego-path file is in use (so a missing entry means "unknown")."""
     h, w = int(ann["imgHeight"]), int(ann["imgWidth"])
     m = np.zeros((h, w), np.uint8)
     objs = ann.get("objects", [])
@@ -95,6 +110,12 @@ def rasterize(ann):
         if np.linalg.norm(a[0] - b[0]) > np.linalg.norm(a[0] - b[-1]):
             b = b[::-1]
         _poly(m, np.concatenate([a, b[::-1]]), ID["track"])
+    if ego_known:
+        if ego and len(ego.get("left_rail", [])) >= 2 and len(ego.get("right_rail", [])) >= 2:
+            el, er = _pts(ego["left_rail"]), _pts(ego["right_rail"])
+            _poly(m, np.concatenate([el, er[::-1]]), EGO_ID)
+        else:
+            m[m == ID["track"]] = IGNORE  # which track is ours is unknown in this frame
     for a, b in pairs:
         _line(m, a, ID["rail"], _gauge_widths(a, b))
         _line(m, b, ID["rail"], _gauge_widths(b, a))
@@ -123,7 +144,22 @@ def main():
 
     root = Path(args.root)
     jsons = sorted(p for p in root.rglob("*.json")
-                   if p.name not in ("json-classes.json", "rs19-config.json"))
+                   if p.name not in ("json-classes.json", "rs19-config.json", EGO_FILE))
+    ego_files = list(root.rglob(EGO_FILE))
+    egopaths = {}
+    if ego_files:
+        raw = json.loads(ego_files[0].read_text())
+        egopaths = {Path(k).stem: v for k, v in raw.items()}
+        print(f"Ego-path annotations: {len(egopaths)} frames from {ego_files[0]}")
+    classes = class_list(bool(ego_files))
+
+    # class set changed since the masks were drawn (e.g. ego-path file added): redraw all
+    cls_file = root / "json-classes.json"
+    if cls_file.exists() and not args.overwrite:
+        old = [l["name"] for l in json.loads(cls_file.read_text())["labels"]]
+        if old != [n for n, _ in classes]:
+            print("Class list changed since the masks were drawn - redrawing all masks")
+            args.overwrite = True
     images = {p.stem: p for p in root.rglob("*.jpg")}
     if not jsons:
         sys.exit(f"No annotation .json files found under {root}")
@@ -140,7 +176,7 @@ def main():
             ann = json.loads(jp.read_text())
             if "objects" not in ann:
                 continue
-            m = rasterize(ann)
+            m = rasterize(ann, egopaths.get(jp.stem), ego_known=bool(ego_files))
         except Exception as e:  # keep going on a malformed file
             print(f"  [warn] {jp.name}: {e}")
             n_bad += 1
@@ -151,7 +187,7 @@ def main():
             prev_dir.mkdir(exist_ok=True)
             img = cv2.imread(str(images[jp.stem]))
             lut = np.zeros((256, 3), np.uint8)
-            for k, (_, c) in enumerate(CLASSES):
+            for k, (_, c) in enumerate(classes):
                 lut[k] = c[::-1]
             lut[IGNORE] = (255, 255, 255)
             col = lut[m]
@@ -161,8 +197,8 @@ def main():
         if (i + 1) % 1000 == 0:
             print(f"  {i + 1}/{len(jsons)}")
 
-    (root / "json-classes.json").write_text(json.dumps(
-        {"labels": [{"name": n, "color": c} for n, c in CLASSES]}, indent=1))
+    cls_file.write_text(json.dumps(
+        {"labels": [{"name": n, "color": c} for n, c in classes]}, indent=1))
     print(f"Masks: {n_done} written, {n_skip} already present, {n_bad} failed -> {out_dir}")
     if args.preview:
         print(f"Previews: {prev_dir}")

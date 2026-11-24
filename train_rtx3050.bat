@@ -16,19 +16,22 @@ if not exist data\railsem19 (
   exit /b 1
 )
 
-REM Copies without dense label maps (jpgs + jsons only): draw masks from the JSON annotations
 set CONFIG=configs/railsem19_pidnet_s_rails.yaml
-if not exist data\railsem19\uint8 (
-  echo No uint8 label maps found - drawing masks from the JSON annotations ^(a few minutes^) ...
+set RASTER=0
+if not exist data\railsem19\uint8 set RASTER=1
+if exist data\railsem19\json-classes.json set RASTER=1
+
+if "%RASTER%"=="1" (
+  REM Copy without dense label maps: draw masks from the JSON annotations
+  REM ^(skips masks that are already up to date^)
   python tools\rasterize_rs19_json.py --root data/railsem19
   if errorlevel 1 goto :fail
+  set CONFIG=configs/railsem19_json_pidnet_s.yaml
+  if exist data\railsem19\rs19_egopath.json set CONFIG=configs/railsem19_json_ego_pidnet_s.yaml
 )
-if exist data\railsem19\json-classes.json set CONFIG=configs/railsem19_json_pidnet_s.yaml
 
-if not exist data\splits\train.txt (
-  python tools\prepare_railsem19.py --root data/railsem19 --out data/splits
-  if errorlevel 1 goto :fail
-)
+python tools\prepare_railsem19.py --root data/railsem19 --out data/splits --stats 0
+if errorlevel 1 goto :fail
 
 echo Config: %CONFIG%
 python train.py --config %CONFIG% --resume auto ^
