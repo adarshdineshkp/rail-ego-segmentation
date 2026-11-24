@@ -11,3 +11,4 @@ __pycache__/
 *.engine
 .venv/
 logs/
+/test_footage/
