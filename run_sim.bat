@@ -2,7 +2,9 @@
 REM Simulated drives: Blender renders a railway scene from a cab camera, and the collision
 REM warning runs live on each frame as it is rendered. Ends with a scoreboard.
 REM   run_sim.bat                         all four scenarios at 36 km/h
-REM   run_sim.bat switch_clear            one scenario: vehicle, person, switch_blocked, switch_clear
+REM   run_sim.bat switch_clear            one scenario: vehicle, person, switch_blocked, switch_clear,
+REM                                       crossover, fouling, against_route
+REM   run_sim.bat "crossover fouling"     several (in quotes)
 REM   run_sim.bat all 15                  all scenarios at 15 m/s (54 km/h)
 REM Your own YOLO models: put the .pt files in a "yolo" folder next to this script
 REM (and pip install ultralytics); they are then used alongside the segmentation.
@@ -16,7 +18,7 @@ call .venv\Scripts\activate.bat || (echo Run setup_windows.bat first. & pause & 
 
 set SCENARIOS=%~1
 if "%SCENARIOS%"=="" set SCENARIOS=all
-if /i "%SCENARIOS%"=="all" set SCENARIOS=vehicle person switch_blocked switch_clear
+if /i "%SCENARIOS%"=="all" set SCENARIOS=vehicle person switch_blocked switch_clear crossover fouling against_route
 set SPEED=%~2
 if "%SPEED%"=="" set SPEED=10
 set CKPT=runs\rs19ego_pidnet_s_b4\best.pt
@@ -89,10 +91,7 @@ for %%S in (%SCENARIOS%) do (
     python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
     echo --- TEP-Net + path lock ---
     python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --tag teplock !YOLO_ARGS!
-    if exist runs\switch_cls\best.pt python sim\has_switch.py "!RUN!" && (
-      echo --- TEP-Net + path lock + switch state from the camera ---
-      python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --switch-cls runs\switch_cls\best.pt --tag tepswitch !YOLO_ARGS!
-    )
+    python sim\has_switch.py "!RUN!" && call :switchpasses "!RUN!"
   )
 )
 
@@ -100,3 +99,16 @@ python sim\summarize.py sim_out
 echo.
 echo Videos and logs are in %~dp0sim_out
 pause
+exit /b 0
+
+:switchpasses
+REM extra passes for switch scenarios: route plan, switch state from the camera, both
+echo --- TEP-Net + path lock + route plan ---
+python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --route-plan --tag tepplan %YOLO_ARGS%
+if exist runs\switch_cls\best.pt (
+  echo --- TEP-Net + path lock + switch state from the camera ---
+  python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --switch-cls runs\switch_cls\best.pt --tag tepswitch %YOLO_ARGS%
+  echo --- TEP-Net + path lock + route plan + switch state from the camera ---
+  python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --route-plan --switch-cls runs\switch_cls\best.pt --tag tepplanswitch %YOLO_ARGS%
+)
+exit /b 0

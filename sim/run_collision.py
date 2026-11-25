@@ -18,6 +18,11 @@
          map (here: the scene layout + the camera's position along the track, i.e. RTK in a real
          train), the classifier votes left/right over the approach, and the lock then takes the
          branch the switch is set for instead of relying on history alone
+--route-plan
+         (with --lock) the planned route through the switch (map / timetable) is known: the lock
+         takes the planned branch. With --switch-cls too, a switch that the camera reads as set
+         AGAINST the plan raises a "switch set against route" alert, and the lock follows the
+         branch the switch is really set for
 --tag    suffix for the output files, e.g. --tag tep -> collision_tep.mp4, summary_tep.json
 
 Writes into the run folder: collision.mp4 (frames with overlay + alert banner),
@@ -38,7 +43,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "sim"))
-from collision import (Params, PathLock, State, analyse, decide, detections_from_boxes, draw_hud,  # noqa: E402
+from collision import (Detection, Params, PathLock, State, analyse, decide, detections_from_boxes, draw_hud,  # noqa: E402
                        path_cutoff, stop_distance)
 from infer import overlay, segment  # noqa: E402
 from railseg.checkpoint import load_trained  # noqa: E402
@@ -134,15 +139,26 @@ SCENARIOS = {
                        "BRAKE in time"),
     "switch_clear": ("facing switch set DIVERGING (right), vehicle on the straight track = NOT in the route",
                      "no WARNING / BRAKE"),
+    "crossover": ("switch set DIVERGING into a crossover to the parallel track; A on main = NOT in route, "
+                  "B on parallel = in route", "BRAKE for B in time, no alarm for A"),
+    "fouling": ("switch set STRAIGHT; vehicle on the diverging track sticks into the clearance",
+                "BRAKE in time"),
+    "against_route": ("route plan says DIVERGE, switch is set STRAIGHT; vehicle on the straight track",
+                      "BRAKE in time (switch against route)"),
 }
 
 
-def draw_scenario(vis, meta, pass_name):
-    """Bottom banner: which scenario is being tested, what should happen, and which pass this is."""
-    sc = meta.get("obstacle", {}).get("scenario", "?")
+def draw_scenario(vis, meta, pass_name, obs_dist=None):
+    """Bottom banner: which scenario is being tested, what should happen, which pass this is, and
+    the true distance to every obstacle."""
+    sc = meta.get("scenario") or meta.get("obstacle", {}).get("scenario", "?")
     desc, expect = SCENARIOS.get(sc, (meta.get("layout", ""), meta.get("expected", "?")))
     lines = [f"SCENARIO: {sc}  |  {meta.get('speed_mps', 0) * 3.6:.0f} km/h  |  pass: {pass_name}",
              desc, f"expected: {expect}"]
+    if obs_dist:
+        lines.append("truth: " + "   ".join(
+            f"{o.get('desc', n)} {d:.0f} m ({'in route' if o.get('in_route') else 'NOT in route'})"
+            for n, (o, d) in obs_dist.items() if d is not None) or "truth: all obstacles passed")
     h, w = vis.shape[:2]
     y0 = h - 70 - 40 * len(lines)
     over = vis.copy()
@@ -151,6 +167,27 @@ def draw_scenario(vis, meta, pass_name):
     for k, t in enumerate(lines):
         cv2.putText(vis, t, (30, y0 + 28 + 40 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.9 if k else 1.0,
                     (0, 255, 255) if k == 0 else (255, 255, 255), 2)
+
+
+def obstacles_of(meta):
+    obs = meta.get("obstacles")
+    if obs:
+        return obs
+    o = meta.get("obstacle", {})
+    return [{"name": None, "desc": "obstacle", "in_route": o.get("in_route", True)}]
+
+
+def attribute(near, dist, obs_dist):
+    """Which obstacle an alert is about: the one whose true distance is closest to the estimate
+    (within a tolerance). Returns (name or None, in_route)."""
+    best = None
+    for name, (o, d) in obs_dist.items():
+        if d is None or not math.isfinite(dist):
+            continue
+        err = abs(dist - d)
+        if err <= max(30.0, 0.4 * d) and (best is None or err < best[0]):
+            best = (err, name, bool(o.get("in_route")))
+    return (best[1], best[2]) if best else (None, False)
 
 
 def fmt(v):
@@ -172,6 +209,7 @@ def main():
     ap.add_argument("--tep-weights", default="tep_weights")
     ap.add_argument("--lock", action="store_true", help="path lock through switch zones (with --ego tep)")
     ap.add_argument("--lock-hold-m", type=float, default=25.0, help="longest hold, metres of travel")
+    ap.add_argument("--route-plan", action="store_true", help="use the planned route through the switch (with --lock)")
     ap.add_argument("--switch-cls", default=None, help="switch-state classifier checkpoint (with --lock)")
     ap.add_argument("--tag", default="", help="suffix for output file names")
     args = ap.parse_args()
@@ -190,7 +228,14 @@ def main():
     fps = meta.get("fps", 10)
     p = Params(f_px=meta["f_px"], cy=meta["cy"], cam_height_m=meta.get("cam_height_above_rail_m", 3.0),
                pitch_deg=meta.get("pitch_deg", 0.0), distance_source=args.distance)
-    in_route = meta.get("obstacle", {}).get("in_route", True)
+    sc_name = meta.get("scenario") or meta.get("obstacle", {}).get("scenario")
+    if meta.get("layout") == "switch" and not meta.get("planned_branch"):   # runs rendered before these fields
+        meta["planned_branch"] = {"switch_blocked": "left", "switch_clear": "right"}.get(sc_name)
+        meta["switch_setting"] = {"switch_blocked": "left", "switch_clear": "right"}.get(sc_name)
+    obstacles = obstacles_of(meta)
+    in_route = any(o.get("in_route") for o in obstacles)
+    conflict_truth = bool(meta.get("planned_branch") and meta.get("switch_setting")
+                          and meta["planned_branch"] != meta["switch_setting"])
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, _, classes = load_trained(args.ckpt, device)
@@ -206,13 +251,16 @@ def main():
     lock = PathLock(max_hold=max(1, int(round(args.lock_hold_m / max(step_m, 1e-3))))) if (tep and args.lock) else None
     held_frames = 0
     voter, switch_s, switch_truth = None, meta.get("switch_s_m"), None
+    plan = meta.get("planned_branch") if (args.route_plan and lock is not None) else None
+    if args.route_plan and lock is not None and not plan:
+        print("--route-plan: this run has no planned route in meta.json (render it again) - ignored")
     if args.switch_cls and lock is not None and switch_s is not None:
         from switch_state import SwitchVoter, switch_box
         voter = SwitchVoter(args.switch_cls, device)
         side = meta.get("turnout_side", "right")            # which way the turnout branches (map)
         diverge = meta.get("obstacle", {}).get("scenario") == "switch_clear"
         other = "left" if side == "right" else "right"
-        switch_truth = side if diverge else other
+        switch_truth = meta.get("switch_setting") or (side if diverge else other)
         vote_log = open(run / f"switch_votes{sfx}.csv", "w", newline="")
         vw = csv.writer(vote_log)
         vw.writerow(["frame", "d_ahead_m", "box_w_px", "p_right", "score", "voted", "decision"])
@@ -222,7 +270,9 @@ def main():
           f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)} | ego path: {args.ego}")
 
     pass_name = {"seg": "segmentation ego path", "tep": "TEP-Net ego path"}[args.ego] \
-        + (" + path lock" if lock else "") + (" + switch state (camera)" if args.switch_cls and lock else "")
+        + (" + path lock" if lock else "") + (" + route plan" if plan else "") \
+        + (" + switch state (camera)" if args.switch_cls and lock else "")
+    false_frames, alert_on, conflict_first = 0, {}, None
     win = f"collision ({args.ego} ego path)"
     if args.show:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -256,17 +306,26 @@ def main():
                 gt = read_gt(run)
             td = gt.get(i, {}).get("true_distance_m", "")
             true_d = float(td) if td not in ("", None) else None
+            row = gt.get(i, {})
+            obs_dist = {}
+            for o in obstacles:
+                v = row.get(f"dist_{o['name']}", "") if o.get("name") else row.get("true_distance_m", "")
+                obs_dist[o.get("name") or "obstacle"] = (o, float(v) if v not in ("", None) else None)
 
             t0 = time.perf_counter()
             label = segment(model, img, device)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             lock_status, alt_label = None, None
-            prefer, sw_box, p_right = None, None, None
-            if voter is not None:
-                cs = gt.get(i, {}).get("camera_s_m", "")
+            prefer, sw_box, p_right, conflict = None, None, None, False
+            cam_s = d_ahead = None
+            if lock is not None and switch_s is not None:
+                cs = row.get("camera_s_m", "")
                 cam_s = float(cs) if cs not in ("", None) else i * step_m
                 d_ahead = switch_s - cam_s
+            if plan and d_ahead is not None and -30.0 < d_ahead < 300.0:
+                prefer = plan
+            if voter is not None:
                 if d_ahead > 3.0:
                     sw_box = switch_box(meta, d_ahead)
                     p_right = voter.add(img, sw_box, i, d_ahead)
@@ -277,7 +336,8 @@ def main():
                             print(f"  frame {i}: switch set {voter.decision.upper()} "
                                   f"(decided {d_ahead:.0f} m before the switch, {voter.votes} frames)")
                 if voter.decision and cam_s < switch_s + 30.0:     # until past the frog
-                    prefer = voter.decision
+                    prefer = voter.decision                          # the blades decide where the train goes
+                    conflict = bool(plan) and voter.decision != plan and d_ahead > 0
             if tep is not None:
                 kind, data = tep_ego(tep, img)
                 if lock is not None and kind != "mask":
@@ -301,15 +361,32 @@ def main():
             if not args.no_cutoff and lock_status != "held":
                 cut = path_cutoff(rows, fit, state, i / fps, speed, p)
                 if cut is not None:
+                    if prefer is not None:   # route through the switch is known: the path "ending" at
+                        cut.advisory = True  # the switch is the other branch peeling away -> TRACKING only
+                        cut.cls += " (switch zone)"
                     dets.append(cut)
+            if conflict:
+                if conflict_first is None:
+                    conflict_first = {"frame": i, "switch_ahead_m": round(d_ahead, 1), "true_distance_m": true_d}
+                    print(f"  frame {i}: SWITCH SET AGAINST ROUTE ({voter.decision}, plan {plan}), {d_ahead:.0f} m ahead")
+                b = tuple(int(v) for v in sw_box) if sw_box is not None else (900, 500, 1020, 560)
+                dets.append(Detection("switch set against route", b, b[3], True, d_ahead, d_ahead, "switch"))
             level, near, dist, ttc, stop = decide(dets, speed, state, p)
             levels.append(level)
 
             vis = overlay(img, label, colors, 0.45, skip)
-            draw_hud(vis, level, near, dist, ttc, stop, speed, true_d if in_route else None, dets)
-            if not in_route and true_d is not None:
-                cv2.putText(vis, f"vehicle {true_d:.0f} m away, NOT on the train's route",
-                            (430, 92), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            draw_hud(vis, level, near, dist, ttc, stop, speed, true_d, dets)
+            if level in ("WARNING", "BRAKE"):
+                if near is not None and near.source == "switch":
+                    who, valid = "switch", conflict_truth
+                else:
+                    who, valid = attribute(near, dist, obs_dist)
+                if not valid:
+                    false_frames += 1
+                a = alert_on.setdefault(who or "nothing (no obstacle there)", {"frames": 0, "valid": valid})
+                a["frames"] += 1
+                if valid and level == "BRAKE" and "first_valid_brake" not in a:
+                    a["first_valid_brake"] = {"frame": i, "true_distance_m": true_d}
             if lock_status in ("held", "switch-set"):
                 msg = ("PATH LOCK: holding committed branch" if lock_status == "held"
                        else f"PATH LOCK: switch set {prefer}, taking that branch")
@@ -325,7 +402,7 @@ def main():
                     txt += f"  this frame p(right) {p_right:.2f}"
                 cv2.putText(vis, txt + f"  vote {voter.score:+.1f} ({voter.votes} frames)", (30, 210),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
-            draw_scenario(vis, meta, pass_name)
+            draw_scenario(vis, meta, pass_name, obs_dist)
             cv2.putText(vis, f"model {model_ms:.0f} ms", (30, vis.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:
@@ -343,7 +420,8 @@ def main():
                                 "true_distance_m": true_d, "source": near.source, "what": near.cls}
                 print(f"  frame {i}: first {level} ({near.cls}, {near.source}) at est. {dist:.0f} m"
                       + (f" (true {true_d:.0f} m)" if true_d is not None else ""))
-            if near is not None and true_d is not None and in_route:
+            if near is not None and true_d is not None and near.source != "switch" and \
+                    attribute(near, dist, obs_dist)[1]:
                 for k, v in (("gauge", near.dist_gauge), ("ground", near.dist_ground)):
                     if math.isfinite(v):
                         errs[k].append(v - true_d)
@@ -366,7 +444,7 @@ def main():
         if args.show:
             cv2.destroyAllWindows()
 
-    summary = {"scenario": meta.get("obstacle", {}).get("scenario"), "expected": meta.get("expected"),
+    summary = {"scenario": meta.get("scenario") or meta.get("obstacle", {}).get("scenario"), "expected": meta.get("expected"),
                "frames": i, "speed_mps": speed, "stop_distance_m": round(stop_distance(speed, p), 1),
                "first_alerts": first,
                "frames_per_level": {lv: levels.count(lv) for lv in ("CLEAR", "TRACKING", "WARNING", "BRAKE")}}
@@ -376,19 +454,28 @@ def main():
             summary[f"{k}_distance_error_m"] = {"mean_abs": round(float(a.mean()), 1),
                                                 "median_abs": round(float(np.median(a)), 1),
                                                 "mean_signed": round(float(np.mean(e)), 1)}
+    summary["alerts_by_target"] = alert_on
+    summary["false_alarm_frames"] = false_frames
+    if conflict_first:
+        summary["switch_against_route_alert"] = conflict_first
+    brakes = [a["first_valid_brake"] for a in alert_on.values() if "first_valid_brake" in a]
+    first_ok = min(brakes, key=lambda b: b["frame"]) if brakes else None
+    fa = f"; false alarm on {false_frames} frames" if false_frames else ""
     if in_route:
-        if "BRAKE" in first and first["BRAKE"]["true_distance_m"] is not None:
-            margin = first["BRAKE"]["true_distance_m"] - summary["stop_distance_m"]
+        if first_ok and first_ok["true_distance_m"] is not None:
+            margin = first_ok["true_distance_m"] - summary["stop_distance_m"]
             summary["brake_margin_m"] = round(margin, 1)
-            summary["verdict"] = ("PASS: stops in time" if margin >= 0 else "FAIL: too late") + \
-                f" (braking needs {summary['stop_distance_m']} m, BRAKE at {first['BRAKE']['true_distance_m']} m)"
+            ok = margin >= 0 and not false_frames
+            summary["verdict"] = ("PASS: stops in time" if ok else "FAIL: " + ("too late" if margin < 0 else "stops in time")
+                                  ) + f" (braking needs {summary['stop_distance_m']} m, BRAKE at " \
+                                      f"{first_ok['true_distance_m']:.0f} m){fa}"
         else:
-            summary["verdict"] = "FAIL: no BRAKE alert was raised"
+            summary["verdict"] = "FAIL: no BRAKE alert for the obstacle in the route" + fa
     else:
-        bad = summary["frames_per_level"]["WARNING"] + summary["frames_per_level"]["BRAKE"]
-        summary["verdict"] = ("PASS: no false alarm" if bad == 0 else
-                              f"FAIL: false alarm on {bad} frames (vehicle is not on the train's route)")
-    summary["ego_source"] = args.ego + (" + path lock" if lock else "") + (" + switch state" if voter else "")
+        summary["verdict"] = ("PASS: no false alarm" if not false_frames else
+                              f"FAIL: false alarm on {false_frames} frames (nothing in the train's route)")
+    summary["ego_source"] = args.ego + (" + path lock" if lock else "") + (" + route plan" if plan else "") \
+        + (" + switch state" if voter else "")
     if voter is not None:
         summary["switch_state"] = {"truth": switch_truth, "decision": voter.decision,
                                    "correct": voter.decision == switch_truth if voter.decision else None,

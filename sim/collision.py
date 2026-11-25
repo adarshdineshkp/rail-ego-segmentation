@@ -252,7 +252,7 @@ def decide(dets, speed_mps, state, p):
 
 
 COLORS = {"CLEAR": (60, 170, 60), "TRACKING": (200, 150, 40), "WARNING": (0, 165, 255), "BRAKE": (0, 0, 230)}
-SRC_COLORS = {"seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255), "alt": (255, 200, 0)}
+SRC_COLORS = {"seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255), "alt": (255, 200, 0), "switch": (255, 0, 255)}
 
 
 def draw_hud(img, level, near, dist, ttc, stop, speed, true_dist=None, dets=()):

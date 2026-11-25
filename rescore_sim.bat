@@ -31,10 +31,7 @@ for %%R in (%RUNS%) do (
       python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
       echo --- TEP-Net + path lock ---
       python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --tag teplock !YOLO_ARGS!
-      if exist runs\switch_cls\best.pt python sim\has_switch.py "sim_out\%%R" && (
-        echo --- TEP-Net + path lock + switch state from the camera ---
-        python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --switch-cls runs\switch_cls\best.pt --tag tepswitch !YOLO_ARGS!
-      )
+      python sim\has_switch.py "sim_out\%%R" && call :switchpasses "sim_out\%%R"
     )
   ) else (
     echo %%R: rendering not finished ^(no done.txt^), skipped
@@ -42,3 +39,15 @@ for %%R in (%RUNS%) do (
 )
 python sim\summarize.py sim_out
 pause
+exit /b 0
+
+:switchpasses
+echo --- TEP-Net + path lock + route plan ---
+python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --route-plan --tag tepplan %YOLO_ARGS%
+if exist runs\switch_cls\best.pt (
+  echo --- TEP-Net + path lock + switch state from the camera ---
+  python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --switch-cls runs\switch_cls\best.pt --tag tepswitch %YOLO_ARGS%
+  echo --- TEP-Net + path lock + route plan + switch state from the camera ---
+  python sim\run_collision.py --run "%~1" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --route-plan --switch-cls runs\switch_cls\best.pt --tag tepplanswitch %YOLO_ARGS%
+)
+exit /b 0

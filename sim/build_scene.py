@@ -10,6 +10,13 @@ Scenarios
                    straight track beyond the switch (in the train's route)       -> expect BRAKE
   switch_clear     same switch set to the DIVERGING (right) track; the vehicle
                    stands on the straight track the train does not take          -> expect no alert
+  crossover        switch set diverging into a crossover to the parallel track (two turnouts);
+                   vehicle A on the main track (passed alongside, not in route),
+                   vehicle B on the parallel track ahead (in route)               -> BRAKE for B only
+  fouling          switch set straight; a vehicle stands on the diverging track just past the
+                   frog, its rear end sticking into the train's clearance        -> expect BRAKE
+  against_route    route plan says diverge, but the switch is set STRAIGHT; vehicle on the
+                   straight track (where the train will really go)               -> expect BRAKE
 
 Writes to --out:
   frames/000000.jpg ...   rendered frames (each written atomically, so a live reader is safe)
@@ -32,7 +39,8 @@ import bpy
 argv = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []
 ap = argparse.ArgumentParser()
 ap.add_argument("--out", default="sim_out/run1")
-ap.add_argument("--scenario", choices=["vehicle", "person", "switch_blocked", "switch_clear"], default="vehicle")
+ap.add_argument("--scenario", choices=["vehicle", "person", "switch_blocked", "switch_clear", "crossover", "fouling",
+                                       "against_route"], default="vehicle")
 ap.add_argument("--speed", type=float, default=10.0, help="train speed, m/s (10 m/s = 36 km/h)")
 ap.add_argument("--fps", type=float, default=10.0, help="frames per simulated second")
 ap.add_argument("--obstacle-s", type=float, default=None, help="obstacle position along the track, m")
@@ -48,8 +56,12 @@ ap.add_argument("--seed", type=int, default=7)
 args = ap.parse_args(argv)
 
 random.seed(args.seed)
-SWITCH = args.scenario.startswith("switch")
-ROUTE_DIVERGE = args.scenario == "switch_clear"
+SCEN = args.scenario
+SWITCH = SCEN not in ("vehicle", "person")
+ROUTE_DIVERGE = SCEN in ("switch_clear", "crossover")    # how the switch is SET = where the train really goes
+CROSSOVER = SCEN == "crossover"
+PLANNED = {"switch_blocked": "left", "switch_clear": "right", "crossover": "right",   # route plan (map)
+           "fouling": "left", "against_route": "right"}.get(SCEN)
 OUT = os.path.abspath(args.out)
 FRAMES = os.path.join(OUT, "frames")
 os.makedirs(FRAMES, exist_ok=True)
@@ -77,6 +89,10 @@ L_STRAIGHT, RADIUS = 90.0, 450.0          # curve layout
 S_SWITCH = 200.0                          # switch layout: switch toe position on the main line
 R_TURNOUT, TURNOUT_ANGLE = 190.0, math.atan(1 / 9)   # 1:9 turnout, diverging to the right
 SECOND_TRACK = 4.5 if SWITCH else -4.5    # neighbouring parallel track (left in switch layout)
+XO_SPACING = 5.0                          # crossover: parallel track this far to the right
+U_CURVE = R_TURNOUT * TURNOUT_ANGLE
+XO_STRAIGHT = (XO_SPACING - 2 * R_TURNOUT * (1 - math.cos(TURNOUT_ANGLE))) / math.sin(TURNOUT_ANGLE)
+XO_LEN = 2 * U_CURVE + XO_STRAIGHT        # crossover length, toe to toe
 
 
 def main_center(s):
@@ -88,14 +104,27 @@ def main_center(s):
 
 
 def branch_center(u):
-    """Diverging track, u metres past the switch toe (curves right, then runs straight)."""
-    u_curve = R_TURNOUT * TURNOUT_ANGLE
-    if u <= u_curve:
+    """Diverging track, u metres past the switch toe (curves right, then runs straight). In the
+    crossover it curves back (reverse curve) and continues as the parallel track."""
+    a = TURNOUT_ANGLE
+    if u <= U_CURVE:
         phi = u / R_TURNOUT
         return S_SWITCH + R_TURNOUT * math.sin(phi), -R_TURNOUT * (1 - math.cos(phi)), -phi
-    x0, y0, th = branch_center(u_curve)
-    d = u - u_curve
-    return x0 + d * math.cos(th), y0 + d * math.sin(th), th
+    x0, y0, th = branch_center(U_CURVE)
+    if not CROSSOVER or u <= U_CURVE + XO_STRAIGHT:
+        d = u - U_CURVE
+        return x0 + d * math.cos(th), y0 + d * math.sin(th), th
+    x2, y2 = x0 + XO_STRAIGHT * math.cos(th), y0 + XO_STRAIGHT * math.sin(th)
+    cx, cy = x2 + R_TURNOUT * math.sin(a), y2 + R_TURNOUT * math.cos(a)
+    if u <= XO_LEN:                                   # reverse curve back to parallel
+        h = -a + (u - U_CURVE - XO_STRAIGHT) / R_TURNOUT
+        return cx + R_TURNOUT * math.sin(h), cy - R_TURNOUT * math.cos(h), h
+    return cx + (u - XO_LEN), -XO_SPACING, 0.0        # on the parallel track
+
+
+def par_center(s):
+    """Crossover layout: the parallel track to the right, parametrised by world x."""
+    return s, -XO_SPACING, 0.0
 
 
 def route_center(s):
@@ -297,33 +326,36 @@ def build_track(name, center, d0, s0, s1, z_shift=0.0, rails=None, sleeper_skip=
     clips.build(f"{name}_clips", M_CLIP)
 
 
-def solve_frog():
+def local_frame(stem, s, x, y):
+    """(along, lateral) of world point (x, y) in the frame of the straight stem at local s."""
+    sx, sy, th = stem(s)
+    return (x - sx) * math.cos(th) + (y - sy) * math.sin(th), -(x - sx) * math.sin(th) + (y - sy) * math.cos(th)
+
+
+def solve_frog(stem, branch):
     """Where the diverging route's left rail crosses the straight route's right rail:
-    returns (s on the main line, u on the branch)."""
+    returns (s on the stem, u on the branch), both measured from the toe."""
     lo, hi = 5.0, 80.0
     for _ in range(60):
         mid = (lo + hi) / 2
-        if offset(branch_center, mid, RAIL_OFF)[1] > -RAIL_OFF:
+        x, y, _ = offset(branch, mid, RAIL_OFF)
+        if local_frame(stem, 0.0, x, y)[1] > -RAIL_OFF:
             lo = mid
         else:
             hi = mid
     u = (lo + hi) / 2
-    return offset(branch_center, u, RAIL_OFF)[0], u
+    x, y, _ = offset(branch, u, RAIL_OFF)
+    return local_frame(stem, 0.0, x, y)[0], u
 
 
-if SWITCH:
-    S_FROG, U_FROG = solve_frog()
-    throat, nose = 1.0, 0.3          # rail ends either side of the theoretical crossing point
-    zone = (S_SWITCH - 2.0, S_FROG + 12.0)
-    # straight route: left stock rail runs through; its right rail is stock rail -> switch blade
-    # -> closure rail -> frog nose -> plain rail
-    build_track("main", main_center, 0.0, -20.0, TRACK_LEN, sleeper_skip=[zone],
-                rails={1: [(-20.0, TRACK_LEN)],
-                       -1: [(-20.0, S_SWITCH), (S_SWITCH + BLADE_LEN, S_FROG - throat), (S_FROG + nose, TRACK_LEN)]})
-    # diverging route: right rail is the curved stock rail; left rail is blade -> closure -> nose
-    u_end = TRACK_LEN - S_SWITCH
-    build_track("branch", branch_center, 0.0, 0.0, u_end, z_shift=-0.006, sleeper_skip=[(0.0, zone[1] - S_SWITCH)],
-                rails={-1: [(0.0, u_end)], 1: [(BLADE_LEN, U_FROG - throat), (U_FROG + nose, u_end)]})
+THROAT, NOSE = 1.0, 0.3       # rail ends either side of the theoretical crossing point
+
+
+def build_turnout(tag, stem, branch, diverge_set, zone_end):
+    """Right-hand turnout in the local frame of a straight `stem` (s = 0 at the toe) with a
+    diverging `branch` (u = 0 at the toe): blades, frog wing/check rails, timbers, point machine.
+    The plain rails and sleepers are built by build_track (with gaps). Returns (s_frog, u_frog)."""
+    s_frog, u_frog = solve_frog(stem, branch)
 
     # switch blades, tapered from a thin tip at the toe to full head width; set to the
     # diverging route the LEFT blade lies against the left stock rail, set straight the RIGHT one.
@@ -337,41 +369,83 @@ if SWITCH:
         return prof
 
     for side in (-1, 1):
-        closed = (side == 1) == ROUTE_DIVERGE
-        along = branch_center if side == 1 else (lambda u: main_center(S_SWITCH + u))
-        sweep(f"blade{side}", along, blade_profile(side, closed), True, 0.0, BLADE_LEN, 0.25, 0.0, M_RAIL)
+        closed = (side == 1) == diverge_set
+        sweep(f"{tag}_blade{side}", branch if side == 1 else stem, blade_profile(side, closed), True,
+              0.0, BLADE_LEN, 0.25, 0.0, M_RAIL)
 
     def plain(name, center, d, a, b):
         prof = [(d - HEAD_W / 2, RAIL_BASE), (d + HEAD_W / 2, RAIL_BASE),
                 (d + HEAD_W / 2, RAIL_TOP - 0.006), (d - HEAD_W / 2, RAIL_TOP - 0.006)]
-        sweep(name, center, prof, True, a, b, 0.5, 0.0, M_RUST)
+        sweep(f"{tag}_{name}", center, prof, True, a, b, 0.5, 0.0, M_RUST)
 
     gap = FLANGEWAY + HEAD_W
     # wing rails beside the two nose rails, check rails opposite the frog on the outer rails
-    plain("wing_straight", main_center, -RAIL_OFF + gap, S_FROG - 0.6, S_FROG + 2.5)
-    plain("wing_diverging", branch_center, RAIL_OFF - gap, U_FROG - 0.6, U_FROG + 2.5)
-    plain("check_straight", main_center, RAIL_OFF - gap, S_FROG - 3.0, S_FROG + 3.0)
-    plain("check_diverging", branch_center, -RAIL_OFF + gap, U_FROG - 3.0, U_FROG + 3.0)
+    plain("wing_straight", stem, -RAIL_OFF + gap, s_frog - 0.6, s_frog + 2.5)
+    plain("wing_diverging", branch, RAIL_OFF - gap, u_frog - 0.6, u_frog + 2.5)
+    plain("check_straight", stem, RAIL_OFF - gap, s_frog - 3.0, s_frog + 3.0)
+    plain("check_diverging", branch, -RAIL_OFF + gap, u_frog - 3.0, u_frog + 3.0)
 
     # long wooden switch timbers carrying both routes, with fastenings
     timbers, tclips = Batch(), Batch()
-    s = zone[0]
-    while s < zone[1]:
-        by = branch_center(max(s - S_SWITCH, 0.0))[1] if s > S_SWITCH else 0.0
-        y_l, y_r = 1.45, min(-1.45, by - 1.45)
-        timbers.box(s, (y_l + y_r) / 2, (SLEEPER_BOT + SLEEPER_TOP) / 2, 0.26, y_l - y_r, SLEEPER_TOP - SLEEPER_BOT, 0.0)
-        for y in (RAIL_OFF, -RAIL_OFF, by - RAIL_OFF):
+    s = -2.0
+    while s < s_frog + zone_end:
+        sx, sy, th = stem(s)
+        if s > 0:
+            bx, by, _ = branch(s)
+            lat = local_frame(stem, s, bx, by)[1]
+        else:
+            lat = 0.0
+        y_l, y_r = 1.45, min(-1.45, lat - 1.45)
+        x, y, _ = offset(stem, s, (y_l + y_r) / 2)
+        timbers.box(x, y, (SLEEPER_BOT + SLEEPER_TOP) / 2, 0.26, y_l - y_r, SLEEPER_TOP - SLEEPER_BOT, th)
+        for d in (RAIL_OFF, -RAIL_OFF, lat - RAIL_OFF):
             for dd in (-0.11, 0.11):
-                tclips.box(s, y + dd, RAIL_BASE + 0.02, 0.10, 0.07, 0.05, 0.0)
+                x, y, _ = offset(stem, s, d + dd)
+                tclips.box(x, y, RAIL_BASE + 0.02, 0.10, 0.07, 0.05, th)
         s += 0.6
-    timbers.build("switch_timbers", M_TIMBER)
-    tclips.build("switch_clips", M_CLIP)
+    timbers.build(f"{tag}_timbers", M_TIMBER)
+    tclips.build(f"{tag}_clips", M_CLIP)
 
     # point machine beside the toe, with its drive rod to the blades
     pm = Batch()
-    pm.box(S_SWITCH + 0.9, RAIL_OFF + 1.25, RAIL_BASE + 0.12, 1.4, 0.55, 0.45, 0.0)
-    pm.box(S_SWITCH + 0.6, 0.35, RAIL_BASE + 0.03, 0.05, 2.6, 0.04, 0.0)
-    pm.build("point_machine", M_MACHINE)
+    _, _, th = stem(0.0)
+    x, y, _ = offset(stem, 0.9, RAIL_OFF + 1.25)
+    pm.box(x, y, RAIL_BASE + 0.12, 1.4, 0.55, 0.45, th)
+    x, y, _ = offset(stem, 0.6, 0.35)
+    pm.box(x, y, RAIL_BASE + 0.03, 0.05, 2.6, 0.04, th)
+    pm.build(f"{tag}_point_machine", M_MACHINE)
+    return s_frog, u_frog
+
+
+if SWITCH:
+    ZONE_END = 6.0 if CROSSOVER else 12.0
+    stem1 = lambda s: main_center(S_SWITCH + s)                       # noqa: E731
+    SF, UF = build_turnout("t1", stem1, branch_center, ROUTE_DIVERGE, ZONE_END)
+    S_FROG = S_SWITCH + SF
+    # straight route: left stock rail runs through; its right rail is stock rail -> switch blade
+    # -> closure rail -> frog nose -> plain rail
+    build_track("main", main_center, 0.0, -20.0, TRACK_LEN, sleeper_skip=[(S_SWITCH - 2.0, S_FROG + ZONE_END)],
+                rails={1: [(-20.0, TRACK_LEN)],
+                       -1: [(-20.0, S_SWITCH), (S_SWITCH + BLADE_LEN, S_FROG - THROAT), (S_FROG + NOSE, TRACK_LEN)]})
+    if CROSSOVER:
+        # second turnout, at the far end of the crossover, seen from the parallel track it joins
+        X2 = branch_center(XO_LEN)[0]
+        stem2 = lambda s: (X2 - s, -XO_SPACING, math.pi)                # noqa: E731
+        def branch2(u):
+            x, y, th = branch_center(XO_LEN - u)
+            return x, y, th + math.pi
+        SF2, UF2 = build_turnout("t2", stem2, branch2, True, ZONE_END)
+        build_track("branch", branch_center, 0.0, 0.0, XO_LEN, z_shift=-0.006,
+                    sleeper_skip=[(0.0, SF + ZONE_END), (XO_LEN - SF2 - ZONE_END, XO_LEN)],
+                    rails={1: [(BLADE_LEN, UF - THROAT), (UF + NOSE, XO_LEN)],
+                           -1: [(0.0, XO_LEN - UF2 - NOSE), (XO_LEN - UF2 + THROAT, XO_LEN - BLADE_LEN)]})
+        build_track("parallel", par_center, 0.0, -20.0, TRACK_LEN, sleeper_skip=[(X2 - SF2 - ZONE_END, X2 + 2.0)],
+                    rails={-1: [(-20.0, TRACK_LEN)],
+                           1: [(-20.0, X2 - SF2 - NOSE), (X2 - SF2 + THROAT, X2 - BLADE_LEN), (X2, TRACK_LEN)]})
+    else:
+        u_end = TRACK_LEN - S_SWITCH
+        build_track("branch", branch_center, 0.0, 0.0, u_end, z_shift=-0.006, sleeper_skip=[(0.0, SF + ZONE_END)],
+                    rails={-1: [(0.0, u_end)], 1: [(BLADE_LEN, UF - THROAT), (UF + NOSE, u_end)]})
 else:
     build_track("main", main_center, 0.0, -20.0, TRACK_LEN)
 build_track("second", main_center, SECOND_TRACK, -20.0, TRACK_LEN)
@@ -389,7 +463,7 @@ for _ in range(420):
         side = -1
     if SWITCH and side < 0 and s > S_SWITCH - 20:
         continue
-    lo = 9 + (abs(SECOND_TRACK) if (side > 0) == (SECOND_TRACK > 0) else 0)
+    lo = 9 + (abs(SECOND_TRACK) if (side > 0) == (SECOND_TRACK > 0) else 0) + (XO_SPACING if CROSSOVER and side < 0 else 0)
     d = side * random.uniform(lo, lo + 50)
     x, y, th = offset(main_center, s, d)
     h = random.uniform(6, 14)
@@ -432,29 +506,53 @@ def build_vehicle(center, s_rear):
     return {"length": L, "width": W, "height": round(z_floor + 3.3 - RAIL_TOP, 2)}
 
 
-# obstacle
-if SWITCH:
+# obstacles: each with the point the train would hit first and whether it is in the train's way
+obstacles = []
+
+
+def add_obstacle(name, desc, in_route, route_s, point, info):
+    obstacles.append({"name": name, "desc": desc, "in_route": in_route, "route_s": round(route_s, 1),
+                      "x": round(point[0], 2), "y": round(point[1], 2), **info})
+
+
+if SCEN in ("switch_blocked", "switch_clear", "against_route"):
     s_obs = args.obstacle_s or (S_SWITCH + 60.0)
-    obs = {"scenario": args.scenario, "s": s_obs, "track": "main (straight)",
-           "route": "diverging" if ROUTE_DIVERGE else "straight"}
-    obs.update(build_vehicle(main_center, s_obs))
-    in_route = not ROUTE_DIVERGE
-elif args.scenario == "vehicle":
+    add_obstacle("vehicle", "vehicle on the straight track", not ROUTE_DIVERGE, s_obs,
+                 offset(main_center, s_obs, 0.0), build_vehicle(main_center, s_obs))
+elif CROSSOVER:
+    s_a = S_SWITCH + 60.0
+    add_obstacle("vehicle_A", "vehicle A on the main track", False, s_a, offset(main_center, s_a, 0.0),
+                 build_vehicle(main_center, s_a))
+    x_b = branch_center(XO_LEN)[0] + 90.0
+    add_obstacle("vehicle_B", "vehicle B on the parallel track", True, S_SWITCH + XO_LEN + 90.0,
+                 par_center(x_b)[:2], build_vehicle(par_center, x_b))
+elif SCEN == "fouling":
+    lo, hi = UF, 80.0                       # rear end where the track centres are 2.6 m apart
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        lo, hi = (mid, hi) if branch_center(mid)[1] > -2.6 else (lo, mid)
+    u_rear = lo
+    info = build_vehicle(branch_center, u_rear)
+    corner = offset(branch_center, u_rear, info["width"] / 2)        # rear corner nearest the main track
+    add_obstacle("vehicle", "vehicle on the diverging track, fouling the main track", True,
+                 S_SWITCH + u_rear, corner, {**info, "track_separation_m": 2.6,
+                                             "intrusion_m": round(1.7 - (2.6 - info["width"] / 2), 2)})
+elif SCEN == "vehicle":
     s_obs = args.obstacle_s or 300.0
-    obs = {"scenario": args.scenario, "s": s_obs}
-    obs.update(build_vehicle(main_center, s_obs))
-    in_route = True
+    add_obstacle("vehicle", "rail vehicle on the ego track", True, s_obs, offset(main_center, s_obs, 0.0),
+                 build_vehicle(main_center, s_obs))
 else:
     s_obs = args.obstacle_s or 300.0
-    obs = {"scenario": args.scenario, "s": s_obs, "height": 1.76}
     x, y, th = offset(main_center, s_obs, 0.0)
     for i, (w, dpt, h, zc, m) in enumerate([(0.45, 0.30, 0.85, RAIL_TOP + 0.42, M_TROUSER),
                                             (0.5, 0.32, 0.65, RAIL_TOP + 1.17, M_SHIRT),
                                             (0.24, 0.24, 0.26, RAIL_TOP + 1.63, M_SKIN)]):
         v, f = box_verts(x, y, zc, dpt, w, h, th, 0)
         make_obj(f"person_{i}", v, f, m)
-    in_route = True
-obs["in_route"] = in_route
+    add_obstacle("person", "person between the ego rails", True, s_obs, (x, y), {"height": 1.76})
+in_route = any(o["in_route"] for o in obstacles)
+target = next((o for o in obstacles if o["in_route"]), obstacles[0])
+obs = {"scenario": SCEN, **target}
 
 # lighting and sky
 sun = bpy.data.objects.new("sun", bpy.data.lights.new("sun", type="SUN"))
@@ -503,10 +601,15 @@ r.use_file_extension = False
 
 # ----------------------------------------------------------------------------- drive
 f_px = args.lens / 36.0 * args.width
-end_s = (S_SWITCH + 170.0) if (SWITCH and ROUTE_DIVERGE) else (s_obs - args.stop_gap)
+end_s = (S_SWITCH + 170.0) if not in_route else (target["route_s"] - args.stop_gap)
 step = args.speed / args.fps
 n_frames = int(end_s / step) + 1
-expected = "BRAKE in time" if in_route else "no WARNING or BRAKE (vehicle is not on the train's route)"
+expected = {
+    "switch_clear": "no WARNING or BRAKE (vehicle is not on the train's route)",
+    "crossover": "BRAKE in time for vehicle B; no WARNING/BRAKE for vehicle A (passed alongside)",
+    "fouling": "BRAKE in time (vehicle on the other track sticks into the clearance)",
+    "against_route": "BRAKE in time (switch set against the planned route; vehicle on the real path)",
+}.get(SCEN, "BRAKE in time")
 meta = {
     "width": args.width, "height": args.height, "fps": args.fps, "speed_mps": args.speed,
     "f_px": f_px, "cx": args.width / 2, "cy": args.height / 2,
@@ -515,14 +618,17 @@ meta = {
     "layout": "switch" if SWITCH else "curve",
     "switch_s_m": S_SWITCH if SWITCH else None,
     "turnout_side": "right" if SWITCH else None,
+    "switch_setting": ("right" if ROUTE_DIVERGE else "left") if SWITCH else None,
+    "planned_branch": PLANNED,
+    "scenario": SCEN, "obstacles": obstacles,
 }
 with open(os.path.join(OUT, "meta.json"), "w") as fh:
     json.dump(meta, fh, indent=1)
 
 gt = open(os.path.join(OUT, "gt.csv"), "w", newline="")
 w = csv.writer(gt)
-w.writerow(["frame", "time_s", "camera_s_m", "true_distance_m", "speed_mps", "in_route"])
-ox, oy, _ = offset(main_center, s_obs, 0.0)
+w.writerow(["frame", "time_s", "camera_s_m", "true_distance_m", "speed_mps", "in_route"]
+           + [f"dist_{o['name']}" for o in obstacles])
 t0 = time.time()
 print(f"Rendering {n_frames} frames ({args.scenario}, {args.speed} m/s, {args.fps} fps) to {FRAMES}", flush=True)
 for i in range(n_frames):
@@ -535,9 +641,14 @@ for i in range(n_frames):
     r.filepath = tmp
     bpy.ops.render.render(write_still=True)
     os.replace(tmp, final)  # atomic: a live reader never sees a half-written frame
-    dist = math.hypot(ox - x, oy - y)
-    ahead = (ox - x) * math.cos(th) + (oy - y) * math.sin(th) > 0
-    w.writerow([i, f"{i / args.fps:.2f}", f"{s:.2f}", f"{dist:.2f}" if ahead else "", args.speed, int(in_route)])
+    dists = []
+    for o in obstacles:
+        ahead = (o["x"] - x) * math.cos(th) + (o["y"] - y) * math.sin(th) > 0
+        dists.append(math.hypot(o["x"] - x, o["y"] - y) if ahead else None)
+    route_d = [d for d, o in zip(dists, obstacles) if o["in_route"] and d is not None]
+    dist = min(route_d) if route_d else (dists[0] if dists[0] is not None else float("nan"))
+    w.writerow([i, f"{i / args.fps:.2f}", f"{s:.2f}", f"{min(route_d):.2f}" if route_d else "", args.speed,
+                int(in_route)] + ["" if d is None else f"{d:.2f}" for d in dists])
     gt.flush()
     if (i + 1) % 10 == 0 or i == 0:
         el = time.time() - t0
