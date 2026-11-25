@@ -61,12 +61,16 @@ for f in os.listdir(FRAMES):  # frames from an earlier, longer run would confuse
         os.remove(os.path.join(FRAMES, f))
 
 # ----------------------------------------------------------------------------- track geometry
-GAUGE = 1.435          # inner faces of the rails
-RAIL_W, RAIL_H = 0.07, 0.16
-BALLAST_TOP = 0.30
-SLEEPER_TOP = 0.44
-RAIL_TOP = SLEEPER_TOP + RAIL_H
-RAIL_OFF = GAUGE / 2 + RAIL_W / 2
+GAUGE = 1.435          # inner faces of the rail heads
+BALLAST_TOP = 0.42     # crib ballast, just below the sleeper tops
+SLEEPER_BOT, SLEEPER_TOP = 0.28, 0.46
+RAIL_BASE = SLEEPER_TOP + 0.012                 # on a rail pad / baseplate
+HEAD_W, WEB_W, FOOT_W = 0.072, 0.017, 0.150     # UIC60-like rail profile, m
+FOOT_H, WEB_TOP, RAIL_H = 0.012, 0.11, 0.159
+RAIL_TOP = RAIL_BASE + RAIL_H
+RAIL_OFF = GAUGE / 2 + HEAD_W / 2               # rail centre line from track centre
+FLANGEWAY = 0.045
+BLADE_LEN = 9.0
 TRACK_LEN = 560.0
 
 L_STRAIGHT, RADIUS = 90.0, 450.0          # curve layout
@@ -121,11 +125,12 @@ def make_obj(name, verts, faces, mat):
 def sweep(name, center, profile, closed, s0, s1, ds, d_base, mat, z_shift=0.0):
     """Extrude a 2-D cross-section [(d, z), ...] along a centre-line function."""
     verts, faces = [], []
-    n = len(profile)
+    prof_at = profile if callable(profile) else (lambda _s: profile)
+    n = len(prof_at(s0))
     steps = max(2, int((s1 - s0) / ds) + 1)
     for i in range(steps):
         s = s0 + (s1 - s0) * i / (steps - 1)
-        for d, z in profile:
+        for d, z in prof_at(s):
             x, y, _ = offset(center, s, d_base + d)
             verts.append((x, y, z + z_shift))
     segs = n if closed else n - 1
@@ -182,7 +187,7 @@ class Batch:
 
 
 # ----------------------------------------------------------------------------- materials
-def material(name, color, rough=0.8, metal=0.0, noise=None, bump=0.0, emission=None):
+def material(name, color, rough=0.8, metal=0.0, noise=None, bump=0.0, emission=None, stones=None):
     """Principled material; optional noise colour variation (noise=(scale, color2)) and bump."""
     m = bpy.data.materials.new(name)
     try:
@@ -216,14 +221,24 @@ def material(name, color, rough=0.8, metal=0.0, noise=None, bump=0.0, emission=N
         if bump > 0:
             bmp = nt.nodes.new("ShaderNodeBump")
             bmp.inputs["Strength"].default_value = bump
-            nt.links.new(tex.outputs["Fac"], bmp.inputs["Height"])
+            height = tex.outputs["Fac"]
+            if stones:  # cellular pattern: individual stones
+                vor = nt.nodes.new("ShaderNodeTexVoronoi")
+                vor.inputs["Scale"].default_value = stones
+                nt.links.new(coord.outputs["Object"], vor.inputs["Vector"])
+                height = vor.outputs["Distance"]
+            nt.links.new(height, bmp.inputs["Height"])
             nt.links.new(bmp.outputs["Normal"], bsdf.inputs["Normal"])
     return m
 
 
-M_BALLAST = material("ballast", (0.33, 0.31, 0.29), 0.95, noise=(60.0, (0.55, 0.53, 0.50)), bump=0.6)
-M_SLEEPER = material("sleeper", (0.42, 0.40, 0.38), 0.9, noise=(8.0, (0.30, 0.28, 0.26)), bump=0.2)
-M_RAIL = material("rail", (0.55, 0.52, 0.50), 0.35, 0.9)
+M_BALLAST = material("ballast", (0.30, 0.29, 0.28), 0.95, noise=(45.0, (0.58, 0.56, 0.53)), bump=1.0, stones=28.0)
+M_SLEEPER = material("sleeper", (0.55, 0.54, 0.52), 0.9, noise=(6.0, (0.42, 0.41, 0.40)), bump=0.15)
+M_TIMBER = material("timber", (0.22, 0.15, 0.10), 0.9, noise=(5.0, (0.15, 0.10, 0.07)), bump=0.2)
+M_RAIL = material("rail_head", (0.72, 0.72, 0.74), 0.22, 1.0)      # polished running surface
+M_RUST = material("rail_rust", (0.36, 0.20, 0.11), 0.8, 0.3, noise=(20.0, (0.25, 0.14, 0.08)), bump=0.1)
+M_CLIP = material("fastening", (0.10, 0.10, 0.11), 0.6, 0.6)
+M_MACHINE = material("point_machine", (0.42, 0.44, 0.46), 0.5, 0.5)
 M_GROUND = material("grass", (0.16, 0.25, 0.08), 1.0, noise=(2.0, (0.30, 0.33, 0.14)), bump=0.3)
 M_TRUNK = material("trunk", (0.18, 0.12, 0.08), 0.9)
 M_LEAF = material("leaves", (0.07, 0.17, 0.05), 0.9, noise=(3.0, (0.12, 0.25, 0.07)))
@@ -243,41 +258,123 @@ for o in list(bpy.data.objects):
     bpy.data.objects.remove(o, do_unlink=True)
 
 
-def build_track(name, center, d0, s0, s1, z_shift=0.0, sleeper_from=None):
-    sweep(f"{name}_ballast", center, [(-2.1, 0.0), (-1.55, BALLAST_TOP), (1.55, BALLAST_TOP), (2.1, 0.0)],
+def rail(name, center, d, s0, s1, ds=1.0, d_base=0.0):
+    """A rail with foot, web and head along `center` at lateral offset d."""
+    if s1 - s0 < 0.05:
+        return
+    for part, (w, z0, z1, m) in {"foot": (FOOT_W, RAIL_BASE, RAIL_BASE + FOOT_H, M_RUST),
+                                 "web": (WEB_W, RAIL_BASE + FOOT_H, RAIL_BASE + WEB_TOP, M_RUST),
+                                 "head": (HEAD_W, RAIL_BASE + WEB_TOP, RAIL_TOP, M_RAIL)}.items():
+        prof = [(d - w / 2, z0), (d + w / 2, z0), (d + w / 2, z1), (d - w / 2, z1)]
+        sweep(f"{name}_{part}", center, prof, True, s0, s1, ds, d_base, m)
+
+
+def inside(s, segs):
+    return any(a <= s <= b for a, b in segs)
+
+
+def build_track(name, center, d0, s0, s1, z_shift=0.0, rails=None, sleeper_skip=()):
+    """Ballast, sleepers with fastenings and rails. rails: {side: [(s_a, s_b), ...]} (default: full length)."""
+    rails = rails or {-1: [(s0, s1)], 1: [(s0, s1)]}
+    sweep(f"{name}_ballast", center, [(-2.5, 0.0), (-1.75, BALLAST_TOP), (1.75, BALLAST_TOP), (2.5, 0.0)],
           False, s0, s1, 2.0, d0, M_BALLAST, z_shift)
-    for side in (-1, 1):
-        r = side * RAIL_OFF
-        prof = [(r - RAIL_W / 2, SLEEPER_TOP), (r + RAIL_W / 2, SLEEPER_TOP),
-                (r + RAIL_W / 2, RAIL_TOP), (r - RAIL_W / 2, RAIL_TOP)]
-        sweep(f"{name}_rail{side}", center, prof, True, s0, s1, 1.0, d0, M_RAIL)
-    b = Batch()
-    s = (sleeper_from if sleeper_from is not None else s0) + 0.3
+    for side, segs in rails.items():
+        for k, (a, b) in enumerate(segs):
+            rail(f"{name}_rail{side}_{k}", center, side * RAIL_OFF, a, b, 1.0, d0)
+    sleepers, clips = Batch(), Batch()
+    s = s0 + 0.3
     while s < s1:
-        x, y, th = offset(center, s, d0)
-        b.box(x, y, (BALLAST_TOP + SLEEPER_TOP) / 2 + 0.01 + z_shift, 0.25, 2.6, SLEEPER_TOP - BALLAST_TOP, th)
-        s += 0.62
-    b.build(f"{name}_sleepers", M_SLEEPER)
+        if not inside(s, sleeper_skip):
+            x, y, th = offset(center, s, d0)
+            sleepers.box(x, y, (SLEEPER_BOT + SLEEPER_TOP) / 2 + z_shift, 0.26, 2.6, SLEEPER_TOP - SLEEPER_BOT, th)
+            for side, segs in rails.items():
+                if inside(s, segs):
+                    for dd in (-0.11, 0.11):
+                        cx, cy, _ = offset(center, s, d0 + side * RAIL_OFF + dd)
+                        clips.box(cx, cy, RAIL_BASE + 0.02, 0.10, 0.07, 0.05, th)
+        s += 0.6
+    sleepers.build(f"{name}_sleepers", M_SLEEPER)
+    clips.build(f"{name}_clips", M_CLIP)
 
 
-build_track("main", main_center, 0.0, -20.0, TRACK_LEN)
-build_track("second", main_center, SECOND_TRACK, -20.0, TRACK_LEN)
+def solve_frog():
+    """Where the diverging route's left rail crosses the straight route's right rail:
+    returns (s on the main line, u on the branch)."""
+    lo, hi = 5.0, 80.0
+    for _ in range(60):
+        mid = (lo + hi) / 2
+        if offset(branch_center, mid, RAIL_OFF)[1] > -RAIL_OFF:
+            lo = mid
+        else:
+            hi = mid
+    u = (lo + hi) / 2
+    return offset(branch_center, u, RAIL_OFF)[0], u
+
 
 if SWITCH:
-    # diverging track: shares the main line's sleepers until the two tracks separate
-    build_track("branch", branch_center, 0.0, 0.0, TRACK_LEN - S_SWITCH, z_shift=-0.006, sleeper_from=28.0)
-    # point blades: ~9 m switch rails from the toe. Set to the diverging route, the LEFT blade
-    # lies against the left stock rail; set straight, the RIGHT blade does. The open blade
-    # stands ~11 cm off its stock rail.
-    blade_len, gap = 9.0, 0.11
+    S_FROG, U_FROG = solve_frog()
+    throat, nose = 1.0, 0.3          # rail ends either side of the theoretical crossing point
+    zone = (S_SWITCH - 2.0, S_FROG + 12.0)
+    # straight route: left stock rail runs through; its right rail is stock rail -> switch blade
+    # -> closure rail -> frog nose -> plain rail
+    build_track("main", main_center, 0.0, -20.0, TRACK_LEN, sleeper_skip=[zone],
+                rails={1: [(-20.0, TRACK_LEN)],
+                       -1: [(-20.0, S_SWITCH), (S_SWITCH + BLADE_LEN, S_FROG - throat), (S_FROG + nose, TRACK_LEN)]})
+    # diverging route: right rail is the curved stock rail; left rail is blade -> closure -> nose
+    u_end = TRACK_LEN - S_SWITCH
+    build_track("branch", branch_center, 0.0, 0.0, u_end, z_shift=-0.006, sleeper_skip=[(0.0, zone[1] - S_SWITCH)],
+                rails={-1: [(0.0, u_end)], 1: [(BLADE_LEN, U_FROG - throat), (U_FROG + nose, u_end)]})
+
+    # switch blades, tapered from a thin tip at the toe to full head width; set to the
+    # diverging route the LEFT blade lies against the left stock rail, set straight the RIGHT one.
+    def blade_profile(side, closed):
+        def prof(u):
+            w = 0.015 + (HEAD_W - 0.015) * min(1.0, u / 6.0)
+            opening = 0.0 if closed else 0.11 * (1.0 - u / BLADE_LEN)  # open at the tip, fixed at the heel
+            d = side * (RAIL_OFF - HEAD_W / 2 - w / 2) - side * opening
+            return [(d - w / 2, RAIL_BASE), (d + w / 2, RAIL_BASE), (d + w / 2, RAIL_TOP - 0.004),
+                    (d - w / 2, RAIL_TOP - 0.004)]
+        return prof
+
     for side in (-1, 1):
         closed = (side == 1) == ROUTE_DIVERGE
-        d_b = side * (RAIL_OFF - RAIL_W) - (0 if closed else side * gap)
-        prof = [(d_b - 0.025, SLEEPER_TOP), (d_b + 0.025, SLEEPER_TOP),
-                (d_b + 0.025, RAIL_TOP - 0.01), (d_b - 0.025, RAIL_TOP - 0.01)]
-        # left blade follows the diverging route, right blade the straight route
         along = branch_center if side == 1 else (lambda u: main_center(S_SWITCH + u))
-        sweep(f"blade{side}", along, prof, True, 0.0, blade_len, 0.5, 0.0, M_RAIL)
+        sweep(f"blade{side}", along, blade_profile(side, closed), True, 0.0, BLADE_LEN, 0.25, 0.0, M_RAIL)
+
+    def plain(name, center, d, a, b):
+        prof = [(d - HEAD_W / 2, RAIL_BASE), (d + HEAD_W / 2, RAIL_BASE),
+                (d + HEAD_W / 2, RAIL_TOP - 0.006), (d - HEAD_W / 2, RAIL_TOP - 0.006)]
+        sweep(name, center, prof, True, a, b, 0.5, 0.0, M_RUST)
+
+    gap = FLANGEWAY + HEAD_W
+    # wing rails beside the two nose rails, check rails opposite the frog on the outer rails
+    plain("wing_straight", main_center, -RAIL_OFF + gap, S_FROG - 0.6, S_FROG + 2.5)
+    plain("wing_diverging", branch_center, RAIL_OFF - gap, U_FROG - 0.6, U_FROG + 2.5)
+    plain("check_straight", main_center, RAIL_OFF - gap, S_FROG - 3.0, S_FROG + 3.0)
+    plain("check_diverging", branch_center, -RAIL_OFF + gap, U_FROG - 3.0, U_FROG + 3.0)
+
+    # long wooden switch timbers carrying both routes, with fastenings
+    timbers, tclips = Batch(), Batch()
+    s = zone[0]
+    while s < zone[1]:
+        by = branch_center(max(s - S_SWITCH, 0.0))[1] if s > S_SWITCH else 0.0
+        y_l, y_r = 1.45, min(-1.45, by - 1.45)
+        timbers.box(s, (y_l + y_r) / 2, (SLEEPER_BOT + SLEEPER_TOP) / 2, 0.26, y_l - y_r, SLEEPER_TOP - SLEEPER_BOT, 0.0)
+        for y in (RAIL_OFF, -RAIL_OFF, by - RAIL_OFF):
+            for dd in (-0.11, 0.11):
+                tclips.box(s, y + dd, RAIL_BASE + 0.02, 0.10, 0.07, 0.05, 0.0)
+        s += 0.6
+    timbers.build("switch_timbers", M_TIMBER)
+    tclips.build("switch_clips", M_CLIP)
+
+    # point machine beside the toe, with its drive rod to the blades
+    pm = Batch()
+    pm.box(S_SWITCH + 0.9, RAIL_OFF + 1.25, RAIL_BASE + 0.12, 1.4, 0.55, 0.45, 0.0)
+    pm.box(S_SWITCH + 0.6, 0.35, RAIL_BASE + 0.03, 0.05, 2.6, 0.04, 0.0)
+    pm.build("point_machine", M_MACHINE)
+else:
+    build_track("main", main_center, 0.0, -20.0, TRACK_LEN)
+build_track("second", main_center, SECOND_TRACK, -20.0, TRACK_LEN)
 
 # ground
 g = 1500.0
