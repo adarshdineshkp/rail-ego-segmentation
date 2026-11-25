@@ -6,7 +6,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1] if len(sys.argv) > 1 else "sim_out")
 rows = []
-for f in sorted(root.glob("*/summary.json")):
+for f in sorted(root.glob("*/summary*.json")):
     s = json.loads(f.read_text())
     fa = s.get("first_alerts", {})
 
@@ -17,7 +17,8 @@ for f in sorted(root.glob("*/summary.json")):
         d = a.get("true_distance_m")
         return f"{d:.0f} m ({a.get('source', '?')})" if d is not None else f"est {a['est_distance_m']:.0f} m"
 
-    rows.append((f.parent.name, f"{s.get('speed_mps', 0) * 3.6:.0f} km/h", f"{s.get('stop_distance_m', 0):.0f} m",
+    tag = f.stem[len("summary"):]
+    rows.append((f.parent.name + (f" [{tag.lstrip('_')} ego]" if tag else " [seg ego]"), f"{s.get('speed_mps', 0) * 3.6:.0f} km/h", f"{s.get('stop_distance_m', 0):.0f} m",
                  at("WARNING"), at("BRAKE"), s.get("verdict", "?")))
 if not rows:
     sys.exit(f"No summary.json under {root}")

@@ -8,6 +8,10 @@
 --show   live window (q / Esc to stop)
 --yolo   one or more Ultralytics YOLO weight files (pip install ultralytics); their boxes go
          through the same in-path test as the segmentation
+--ego tep --tep-weights tep_weights
+         take the ego path from TEP-Net (regression model from train-ego-path-detection)
+         instead of the segmentation's ego-track class; everything else stays the same
+--tag    suffix for the output files, e.g. --tag tep -> collision_tep.mp4, summary_tep.json
 
 Writes into the run folder: collision.mp4 (frames with overlay + alert banner),
 collision_log.csv (per frame), summary.json (alerts vs ground truth, verdict).
@@ -66,6 +70,39 @@ def yolo_boxes(models, img, device, conf):
     return out
 
 
+def load_tep(weights_root, device):
+    """Load a TEP-Net model; weights_root is a model folder (config.yaml + best.pt) or a folder
+    of them, in which case a regression model is preferred (EfficientNet before ResNet)."""
+    import yaml
+    sys.path.insert(0, str(ROOT / "third_party" / "tep"))
+    from src.utils.interface import Detector  # noqa: E402  (TEP-Net, MIT)
+    root = Path(weights_root)
+    cands = [root] if (root / "config.yaml").exists() else [d for d in root.iterdir() if (d / "config.yaml").exists()]
+    if not cands:
+        sys.exit(f"No TEP-Net model folders (config.yaml + best.pt) under {root}")
+
+    def rank(d):
+        c = yaml.safe_load(open(d / "config.yaml"))
+        return (c.get("method") != "regression", "efficientnet" not in str(c.get("backbone", "")), d.name)
+
+    chosen = sorted(cands, key=rank)[0]
+    cfg = yaml.safe_load(open(chosen / "config.yaml"))
+    print(f"TEP-Net: {chosen.name} ({cfg.get('method')}, {cfg.get('backbone')})")
+    return Detector(str(chosen), "auto", "pytorch", "cuda" if device.type == "cuda" else "cpu")
+
+
+def tep_ego(detector, img_bgr):
+    """Ego-path polygon (int32 Nx2) from TEP-Net, or None."""
+    from PIL import Image
+    res = detector.detect(Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)))
+    if isinstance(res, list):
+        if len(res) != 2 or len(res[0]) < 2 or len(res[1]) < 2:
+            return None
+        return np.array(res[0] + res[1][::-1], dtype=np.int32)
+    mask = np.array(res) > 0          # segmentation-head models return a mask
+    return mask if mask.any() else None
+
+
 def fmt(v):
     return "" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.1f}"
 
@@ -81,7 +118,11 @@ def main():
     ap.add_argument("--no-cutoff", action="store_true", help="disable the class-agnostic path cut-off cue")
     ap.add_argument("--distance", choices=["gauge", "ground"], default="gauge")
     ap.add_argument("--speed", type=float, default=None, help="m/s, if meta.json has none")
+    ap.add_argument("--ego", choices=["seg", "tep"], default="seg", help="where the ego path comes from")
+    ap.add_argument("--tep-weights", default="tep_weights")
+    ap.add_argument("--tag", default="", help="suffix for output file names")
     args = ap.parse_args()
+    sfx = f"_{args.tag}" if args.tag else ""
 
     run = Path(args.run)
     frames_dir = run / "frames"
@@ -107,16 +148,18 @@ def main():
     colors = classes["colors"]
     skip = ids.get("background")
     yolos = load_yolo(args.yolo)
+    tep = load_tep(args.tep_weights, device) if args.ego == "tep" else None
     print(f"Scenario: {meta.get('obstacle', {}).get('scenario', '?')} | expected: {meta.get('expected', '?')}")
     print(f"Device: {device} | speed {speed} m/s | distance from {args.distance} | "
-          f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)}")
+          f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)} | ego path: {args.ego}")
 
+    win = f"collision ({args.ego} ego path)"
     if args.show:
-        cv2.namedWindow("collision", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("collision", 1280, 720)
+        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(win, 1280, 720)
     writer = None
     state = State()
-    log = open(run / "collision_log.csv", "w", newline="")
+    log = open(run / f"collision_log{sfx}.csv", "w", newline="")
     lw = csv.writer(log)
     lw.writerow(["frame", "level", "in_path", "source", "est_distance_m", "dist_gauge_m", "dist_ground_m",
                  "true_distance_m", "ttc_s", "stop_distance_m", "model_ms"])
@@ -148,6 +191,19 @@ def main():
             label = segment(model, img, device)
             if device.type == "cuda":
                 torch.cuda.synchronize()
+            if tep is not None:
+                ego_id = ids["ego-track"]
+                label[label == ego_id] = ids.get("track", ids.get("background", 0))
+                poly = tep_ego(tep, img)
+                if isinstance(poly, np.ndarray) and poly.dtype == bool:
+                    label[poly & (label != ids.get("on-rails", -1)) & (label != ids.get("human", -1))] = ego_id
+                elif poly is not None:
+                    m = np.zeros(label.shape, np.uint8)
+                    cv2.fillPoly(m, [poly], 1)
+                    keep = (label == ids.get("on-rails", -1)) | (label == ids.get("human", -1))
+                    label[(m > 0) & ~keep] = ego_id   # objects stay on top of the path
+            if device.type == "cuda":
+                torch.cuda.synchronize()
             model_ms = (time.perf_counter() - t0) * 1000
             dets, rows, fit = analyse(label, ids, p)
             if yolos:
@@ -168,10 +224,10 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:
                 h, w = vis.shape[:2]
-                writer = cv2.VideoWriter(str(run / "collision.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                writer = cv2.VideoWriter(str(run / f"collision{sfx}.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
             writer.write(vis)
             if args.show:
-                cv2.imshow("collision", vis)
+                cv2.imshow(win, vis)
                 if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
                     print("stopped from the window")
                     break
@@ -224,9 +280,10 @@ def main():
         bad = summary["frames_per_level"]["WARNING"] + summary["frames_per_level"]["BRAKE"]
         summary["verdict"] = ("PASS: no false alarm" if bad == 0 else
                               f"FAIL: false alarm on {bad} frames (vehicle is not on the train's route)")
-    (run / "summary.json").write_text(json.dumps(summary, indent=1))
+    summary["ego_source"] = args.ego
+    (run / f"summary{sfx}.json").write_text(json.dumps(summary, indent=1))
     print("\nSummary:\n" + json.dumps(summary, indent=1))
-    print(f"\nVideo: {run / 'collision.mp4'}")
+    print(f"\nVideo: {run / f'collision{sfx}.mp4'}")
 
 
 if __name__ == "__main__":

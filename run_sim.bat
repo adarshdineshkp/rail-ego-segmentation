@@ -6,7 +6,10 @@ REM   run_sim.bat switch_clear            one scenario: vehicle, person, switch_
 REM   run_sim.bat all 15                  all scenarios at 15 m/s (54 km/h)
 REM Your own YOLO models: put the .pt files in a "yolo" folder next to this script
 REM (and pip install ultralytics); they are then used alongside the segmentation.
+REM TEP-Net comparison: copy the "weights" folder from egopath.zip to a "tep_weights" folder
+REM next to this script; each rendered drive is then also evaluated with TEP-Net's ego path.
 REM Results: sim_out\<scenario>_<speed>\collision.mp4, collision_log.csv, summary.json
+REM          (and collision_tep.mp4, summary_tep.json for the TEP-Net pass)
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 call .venv\Scripts\activate.bat || (echo Run setup_windows.bat first. & pause & exit /b 1)
@@ -55,6 +58,24 @@ if exist yolo\*.pt (
   )
 )
 
+REM --- optional TEP-Net (needs torchvision, matched to the installed torch)
+set TEP=0
+if exist tep_weights (
+  python -c "import torchvision" 2>nul
+  if errorlevel 1 (
+    echo Installing torchvision for TEP-Net ...
+    for /f "delims=" %%V in ('python -c "import torch;print(torch.__version__)"') do set TORCHV=%%V
+    python -m pip install torchvision "torch==!TORCHV!" --index-url https://download.pytorch.org/whl/cu126
+  )
+  python -c "import torchvision" 2>nul
+  if errorlevel 1 (
+    echo torchvision could not be installed - skipping the TEP-Net comparison.
+  ) else (
+    set TEP=1
+    echo TEP-Net comparison: on ^(tep_weights^)
+  )
+)
+
 for %%S in (%SCENARIOS%) do (
   set RUN=sim_out\%%S_%SPEED%
   echo.
@@ -63,6 +84,10 @@ for %%S in (%SCENARIOS%) do (
   mkdir "!RUN!"
   start "Blender render - %%S" /min cmd /c ""!BLENDER!" -b --factory-startup --python sim\build_scene.py -- --out "!RUN!" --scenario %%S --speed %SPEED% > logs\blender_%%S_%SPEED%.log 2>&1"
   python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --watch --show !YOLO_ARGS!
+  if "!TEP!"=="1" (
+    echo --- same drive with TEP-Net's ego path ---
+    python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
+  )
 )
 
 python sim\summarize.py sim_out
