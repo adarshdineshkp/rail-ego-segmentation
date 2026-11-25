@@ -31,6 +31,10 @@ for %%R in (%RUNS%) do (
       python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
       echo --- TEP-Net + path lock ---
       python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --tag teplock !YOLO_ARGS!
+      if exist runs\switch_cls\best.pt python sim\has_switch.py "sim_out\%%R" && (
+        echo --- TEP-Net + path lock + switch state from the camera ---
+        python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --switch-cls runs\switch_cls\best.pt --tag tepswitch !YOLO_ARGS!
+      )
     )
   ) else (
     echo %%R: rendering not finished ^(no done.txt^), skipped

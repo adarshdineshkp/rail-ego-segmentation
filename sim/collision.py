@@ -325,17 +325,48 @@ class PathLock:
         dx = np.abs(np.interp(ys, ya, xa) - np.interp(ys, yb, xb))
         return float(np.median((dx / w)[far]))
 
-    def update(self, rails, frame=None):
-        """Returns (rails to use, status): free / stable / held / released.
+    @staticmethod
+    def far_shift(a, b):
+        """Signed median centre-line shift of a relative to b over the far rows, in track widths
+        (> 0: a lies to the right of b)."""
+        ya, xa, _ = a
+        yb, xb, wb = b
+        lo, hi = max(ya[0], yb[0]), min(ya[-1], yb[-1])
+        if hi - lo < 10:
+            return 0.0
+        ys = np.linspace(lo, hi, 96)
+        w = np.maximum(np.interp(ys, yb, wb), 2.0)
+        far = w <= 0.3 * w.max()
+        if not far.any():
+            return 0.0
+        return float(np.median(((np.interp(ys, ya, xa) - np.interp(ys, yb, xb)) / w)[far]))
+
+    def update(self, rails, frame=None, prefer=None):
+        """Returns (rails to use, status): free / stable / held / released / switch-set.
+        prefer = "left" / "right": which branch the switch ahead is set for (from the switch-state
+        vote). Then the branch on that side is taken and the other one is held off for as long as
+        prefer is given (no hold limit: the decision comes from the blades, not from history).
         While held, `alt_rails` is the rejected path (for advisory checks)."""
         self.alt_rails = None
         new = self._centre(rails) if rails is not None else None
         if new is None:
-            return (self.ref_rails if self.held and self.held < self.max_hold else None), "free"
+            return (self.ref_rails if self.held and (prefer or self.held < self.max_hold) else None), "free"
         if self.ref is None:
             self._accept(rails, new)
             return rails, "free"
         d_ref = self.far_diff(new, self.ref)
+        if prefer is not None and d_ref > self.far_tol:
+            dx = self.far_shift(new, self.ref)
+            if (dx > 0) == (prefer == "right"):          # new path is on the side the switch is set for
+                self.events.append({"frame": frame, "switch_set": prefer})
+                self._accept(rails, new)
+                self.stable = self.commit_frames
+                return rails, "switch-set"
+            self.held += 1                               # other branch: hold, no limit
+            if self.alt is None:
+                self.alt = new
+            self.alt_rails = rails
+            return self.ref_rails, "held"
         if d_ref <= self.far_tol or (self.held and self.alt is not None and d_ref < self.far_diff(new, self.alt)):
             self._accept(rails, new)
             self.stable += 1

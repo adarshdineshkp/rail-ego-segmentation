@@ -514,6 +514,7 @@ meta = {
     "gauge_m": GAUGE, "obstacle": obs, "n_frames": n_frames, "expected": expected,
     "layout": "switch" if SWITCH else "curve",
     "switch_s_m": S_SWITCH if SWITCH else None,
+    "turnout_side": "right" if SWITCH else None,
 }
 with open(os.path.join(OUT, "meta.json"), "w") as fh:
     json.dump(meta, fh, indent=1)

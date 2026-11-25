@@ -13,6 +13,11 @@
          instead of the segmentation's ego-track class; everything else stays the same
 --lock   (with --ego tep) path lock: keep the committed branch through a switch zone when the
          model briefly flips to the other branch; objects on the rejected branch become advisories
+--switch-cls runs/switch_cls/best.pt
+         (with --lock) read the switch state from the camera: the switch position comes from the
+         map (here: the scene layout + the camera's position along the track, i.e. RTK in a real
+         train), the classifier votes left/right over the approach, and the lock then takes the
+         branch the switch is set for instead of relying on history alone
 --tag    suffix for the output files, e.g. --tag tep -> collision_tep.mp4, summary_tep.json
 
 Writes into the run folder: collision.mp4 (frames with overlay + alert banner),
@@ -141,6 +146,7 @@ def main():
     ap.add_argument("--tep-weights", default="tep_weights")
     ap.add_argument("--lock", action="store_true", help="path lock through switch zones (with --ego tep)")
     ap.add_argument("--lock-hold-m", type=float, default=25.0, help="longest hold, metres of travel")
+    ap.add_argument("--switch-cls", default=None, help="switch-state classifier checkpoint (with --lock)")
     ap.add_argument("--tag", default="", help="suffix for output file names")
     args = ap.parse_args()
     sfx = f"_{args.tag}" if args.tag else ""
@@ -173,6 +179,18 @@ def main():
     step_m = speed / fps if fps else 1.0
     lock = PathLock(max_hold=max(1, int(round(args.lock_hold_m / max(step_m, 1e-3))))) if (tep and args.lock) else None
     held_frames = 0
+    voter, switch_s, switch_truth = None, meta.get("switch_s_m"), None
+    if args.switch_cls and lock is not None and switch_s is not None:
+        from switch_state import SwitchVoter, switch_box
+        voter = SwitchVoter(args.switch_cls, device)
+        side = meta.get("turnout_side", "right")            # which way the turnout branches (map)
+        diverge = meta.get("obstacle", {}).get("scenario") == "switch_clear"
+        other = "left" if side == "right" else "right"
+        switch_truth = side if diverge else other
+        vote_log = open(run / f"switch_votes{sfx}.csv", "w", newline="")
+        vw = csv.writer(vote_log)
+        vw.writerow(["frame", "d_ahead_m", "box_w_px", "p_right", "score", "decision"])
+        print(f"Switch state from camera: {args.switch_cls} (switch at {switch_s} m, true setting {switch_truth})")
     print(f"Scenario: {meta.get('obstacle', {}).get('scenario', '?')} | expected: {meta.get('expected', '?')}")
     print(f"Device: {device} | speed {speed} m/s | distance from {args.distance} | "
           f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)} | ego path: {args.ego}")
@@ -216,10 +234,26 @@ def main():
             if device.type == "cuda":
                 torch.cuda.synchronize()
             lock_status, alt_label = None, None
+            prefer, sw_box, p_right = None, None, None
+            if voter is not None:
+                cs = gt.get(i, {}).get("camera_s_m", "")
+                cam_s = float(cs) if cs not in ("", None) else i * step_m
+                d_ahead = switch_s - cam_s
+                if voter.decision is None:
+                    sw_box = switch_box(meta, d_ahead)
+                    p_right = voter.add(img, sw_box, i, d_ahead)
+                    if p_right is not None:
+                        vw.writerow([i, f"{d_ahead:.1f}", f"{sw_box[2] - sw_box[0]:.0f}", f"{p_right:.3f}",
+                                     f"{voter.score:.2f}", voter.decision or ""])
+                        if voter.decision:
+                            print(f"  frame {i}: switch set {voter.decision.upper()} "
+                                  f"(decided {d_ahead:.0f} m before the switch, {voter.votes} frames)")
+                if voter.decision and cam_s < switch_s + 30.0:     # until past the frog
+                    prefer = voter.decision
             if tep is not None:
                 kind, data = tep_ego(tep, img)
                 if lock is not None and kind != "mask":
-                    used, lock_status = lock.update(data, i)
+                    used, lock_status = lock.update(data, i, prefer)
                     if lock_status == "held":
                         held_frames += 1
                         alt_label = paint_ego(label.copy(), ids, "rails", lock.alt_rails)
@@ -248,9 +282,18 @@ def main():
             if not in_route and true_d is not None:
                 cv2.putText(vis, f"vehicle {true_d:.0f} m away, NOT on the train's route",
                             (430, 92), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-            if lock_status == "held":
-                cv2.putText(vis, "PATH LOCK: holding committed branch", (30, 160),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
+            if lock_status in ("held", "switch-set"):
+                msg = ("PATH LOCK: holding committed branch" if lock_status == "held"
+                       else f"PATH LOCK: switch set {prefer}, taking that branch")
+                cv2.putText(vis, msg, (30, 160), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
+            if voter is not None:
+                if sw_box is not None:
+                    x0, y0, x1, y1 = map(int, sw_box)
+                    cv2.rectangle(vis, (x0, y0), (x1, y1), (255, 0, 255), 2)
+                txt = (f"switch: set {voter.decision.upper()}" if voter.decision else
+                       f"switch: reading... p(right) {p_right:.2f}" if p_right is not None else "switch: not in view")
+                cv2.putText(vis, txt + f"  vote {voter.score:+.1f} ({voter.votes} frames)", (30, 210),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
             cv2.putText(vis, f"model {model_ms:.0f} ms", (30, vis.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:
@@ -284,6 +327,8 @@ def main():
         print("stopped with Ctrl+C")
     finally:
         log.close()
+        if voter is not None:
+            vote_log.close()
         if writer is not None:
             writer.release()
         if args.show:
@@ -311,7 +356,12 @@ def main():
         bad = summary["frames_per_level"]["WARNING"] + summary["frames_per_level"]["BRAKE"]
         summary["verdict"] = ("PASS: no false alarm" if bad == 0 else
                               f"FAIL: false alarm on {bad} frames (vehicle is not on the train's route)")
-    summary["ego_source"] = args.ego + (" + path lock" if lock else "")
+    summary["ego_source"] = args.ego + (" + path lock" if lock else "") + (" + switch state" if voter else "")
+    if voter is not None:
+        summary["switch_state"] = {"truth": switch_truth, "decision": voter.decision,
+                                   "correct": voter.decision == switch_truth if voter.decision else None,
+                                   "decided_at": voter.decided_at, "votes": voter.votes,
+                                   "single_frame_accuracy": voter.single_frame_accuracy(switch_truth)}
     if lock:
         summary["path_lock"] = {"held_frames": held_frames, "releases": lock.events}
     (run / f"summary{sfx}.json").write_text(json.dumps(summary, indent=1))
