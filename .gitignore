@@ -12,3 +12,4 @@ __pycache__/
 .venv/
 logs/
 /test_footage/
+/sim_out/

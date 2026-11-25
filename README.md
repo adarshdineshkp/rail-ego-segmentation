@@ -90,3 +90,14 @@ tools/                               prepare split, download weights, smoke test
 - **Pretrained weights** are hosted on the PIDNet author's Google Drive, and the author says some links no longer work. If `tools/download_weights.py` fails, download the files manually from the folder link it prints. Then run `python tools/smoke_test.py --weights <file>` to confirm they load (it reports how many tensors matched).
 - **Memory:** PIDNet-S with batch size 8 at 768×1024 needs about 16 GB with AMP. On a smaller GPU, use `train.batch_size=4` or a smaller `data.train.crop_size`.
 - **License:** RailSem19 is for research use under its own terms. PIDNet is MIT-licensed.
+
+## Simulated drive (Blender)
+
+`run_sim.bat` (or `blender -b --factory-startup --python sim/build_scene.py -- --out sim_out/run1`
+followed by `python sim/run_collision.py --run sim_out/run1 --ckpt <best.pt> --show`) renders a
+procedural railway scene from a cab camera, with a vehicle or a person standing on the track in a
+curve, and runs the collision warning on every frame as it is rendered. `sim/collision.py` holds the
+logic: ego corridor at clearance width, in-path test, distance from the track gauge and from the
+ground plane, k-of-n persistence, and braking-distance alert levels. Each run writes
+`collision.mp4`, `collision_log.csv` and `summary.json` (when each alert fired vs the true distance,
+and whether braking would have been in time).
