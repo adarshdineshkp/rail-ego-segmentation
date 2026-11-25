@@ -127,6 +127,32 @@ def paint_ego(label, ids, kind, data):
     return label
 
 
+SCENARIOS = {
+    "vehicle": ("left-hand curve, rail vehicle standing on the ego track", "BRAKE in time"),
+    "person": ("left-hand curve, person standing between the ego rails", "BRAKE in time"),
+    "switch_blocked": ("facing switch set STRAIGHT, vehicle on the straight track = in the route",
+                       "BRAKE in time"),
+    "switch_clear": ("facing switch set DIVERGING (right), vehicle on the straight track = NOT in the route",
+                     "no WARNING / BRAKE"),
+}
+
+
+def draw_scenario(vis, meta, pass_name):
+    """Bottom banner: which scenario is being tested, what should happen, and which pass this is."""
+    sc = meta.get("obstacle", {}).get("scenario", "?")
+    desc, expect = SCENARIOS.get(sc, (meta.get("layout", ""), meta.get("expected", "?")))
+    lines = [f"SCENARIO: {sc}  |  {meta.get('speed_mps', 0) * 3.6:.0f} km/h  |  pass: {pass_name}",
+             desc, f"expected: {expect}"]
+    h, w = vis.shape[:2]
+    y0 = h - 70 - 40 * len(lines)
+    over = vis.copy()
+    cv2.rectangle(over, (0, y0 - 10), (w, h - 60), (30, 30, 30), -1)
+    cv2.addWeighted(over, 0.6, vis, 0.4, 0, vis)
+    for k, t in enumerate(lines):
+        cv2.putText(vis, t, (30, y0 + 28 + 40 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.9 if k else 1.0,
+                    (0, 255, 255) if k == 0 else (255, 255, 255), 2)
+
+
 def fmt(v):
     return "" if v is None or (isinstance(v, float) and not math.isfinite(v)) else f"{v:.1f}"
 
@@ -189,12 +215,14 @@ def main():
         switch_truth = side if diverge else other
         vote_log = open(run / f"switch_votes{sfx}.csv", "w", newline="")
         vw = csv.writer(vote_log)
-        vw.writerow(["frame", "d_ahead_m", "box_w_px", "p_right", "score", "decision"])
+        vw.writerow(["frame", "d_ahead_m", "box_w_px", "p_right", "score", "voted", "decision"])
         print(f"Switch state from camera: {args.switch_cls} (switch at {switch_s} m, true setting {switch_truth})")
     print(f"Scenario: {meta.get('obstacle', {}).get('scenario', '?')} | expected: {meta.get('expected', '?')}")
     print(f"Device: {device} | speed {speed} m/s | distance from {args.distance} | "
           f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)} | ego path: {args.ego}")
 
+    pass_name = {"seg": "segmentation ego path", "tep": "TEP-Net ego path"}[args.ego] \
+        + (" + path lock" if lock else "") + (" + switch state (camera)" if args.switch_cls and lock else "")
     win = f"collision ({args.ego} ego path)"
     if args.show:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -239,13 +267,13 @@ def main():
                 cs = gt.get(i, {}).get("camera_s_m", "")
                 cam_s = float(cs) if cs not in ("", None) else i * step_m
                 d_ahead = switch_s - cam_s
-                if voter.decision is None:
+                if d_ahead > 3.0:
                     sw_box = switch_box(meta, d_ahead)
                     p_right = voter.add(img, sw_box, i, d_ahead)
                     if p_right is not None:
                         vw.writerow([i, f"{d_ahead:.1f}", f"{sw_box[2] - sw_box[0]:.0f}", f"{p_right:.3f}",
-                                     f"{voter.score:.2f}", voter.decision or ""])
-                        if voter.decision:
+                                     f"{voter.score:.2f}", int(voter.history[-1]["voted"]), voter.decision or ""])
+                        if voter.decision and voter.decided_at["frame"] == i:
                             print(f"  frame {i}: switch set {voter.decision.upper()} "
                                   f"(decided {d_ahead:.0f} m before the switch, {voter.votes} frames)")
                 if voter.decision and cam_s < switch_s + 30.0:     # until past the frog
@@ -291,9 +319,13 @@ def main():
                     x0, y0, x1, y1 = map(int, sw_box)
                     cv2.rectangle(vis, (x0, y0), (x1, y1), (255, 0, 255), 2)
                 txt = (f"switch: set {voter.decision.upper()}" if voter.decision else
-                       f"switch: reading... p(right) {p_right:.2f}" if p_right is not None else "switch: not in view")
+                       "switch: reading..." if p_right is not None else
+                       "switch: too far to read" if sw_box is not None else "switch: not in view")
+                if p_right is not None:
+                    txt += f"  this frame p(right) {p_right:.2f}"
                 cv2.putText(vis, txt + f"  vote {voter.score:+.1f} ({voter.votes} frames)", (30, 210),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
+            draw_scenario(vis, meta, pass_name)
             cv2.putText(vis, f"model {model_ms:.0f} ms", (30, vis.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:
@@ -361,7 +393,8 @@ def main():
         summary["switch_state"] = {"truth": switch_truth, "decision": voter.decision,
                                    "correct": voter.decision == switch_truth if voter.decision else None,
                                    "decided_at": voter.decided_at, "votes": voter.votes,
-                                   "single_frame_accuracy": voter.single_frame_accuracy(switch_truth)}
+                                   "single_frame_accuracy": voter.single_frame_accuracy(switch_truth),
+                                   "accuracy_by_box_width": voter.accuracy_by_width(switch_truth)}
     if lock:
         summary["path_lock"] = {"held_frames": held_frames, "releases": lock.events}
     (run / f"summary{sfx}.json").write_text(json.dumps(summary, indent=1))

@@ -11,7 +11,9 @@ two branches. For a right-hand turnout, "left" = straight on, "right" = divergin
 
 Votes are summed as log-odds across frames (each frame clipped, so one overconfident frame cannot
 decide alone); the decision is taken once the sum passes `threshold` with at least `min_votes`
-frames. Far-away frames count for less (weight grows with the box width).
+frames. Only boxes at least min_width px wide vote (validation: below ~40 px the blade gap is
+too small to read and the model falls back on a bias); bigger boxes count for more. After the
+decision the model keeps classifying (logged, not voted) so its accuracy can be checked.
 """
 import math
 import sys
@@ -65,7 +67,7 @@ def switch_box(meta, d_ahead, margin=0.35):
 
 
 class SwitchVoter:
-    def __init__(self, ckpt, device, threshold=4.6, min_votes=5, clip=2.5, min_width=16):
+    def __init__(self, ckpt, device, threshold=4.6, min_votes=5, clip=2.5, min_width=60):
         ck = torch.load(ckpt, map_location="cpu", weights_only=False)
         self.classes, self.size = ck["classes"], ck["size"]
         self.ctx = ck.get("crop_context", [2.0, 3.0])
@@ -87,15 +89,17 @@ class SwitchVoter:
             return None
         crop = crop_with_context(img, box, *self.ctx)
         x = to_tensor(np.ascontiguousarray(crop), self.size)[None].to(self.device)
+        voting = self.decision is None
         prob = torch.softmax(self.model(x).float(), 1)[0].cpu().numpy()
         pl, pr = float(prob[self.il]), float(prob[self.ir])
         lo = float(np.clip(math.log((pr + 1e-6) / (pl + 1e-6)), -self.clip, self.clip))
-        wgt = float(np.clip((box[2] - box[0]) / 100.0, 0.3, 1.0))   # far = small = less weight
-        self.score += wgt * lo
-        self.votes += 1
+        wgt = float(np.clip((box[2] - box[0]) / 150.0, 0.4, 1.0))   # far = small = less weight
+        if voting:
+            self.score += wgt * lo
+            self.votes += 1
         self.history.append({"frame": frame, "d_ahead_m": None if d_ahead is None else round(d_ahead, 1),
                              "box_w": round(box[2] - box[0]), "p_right": round(pr / (pl + pr), 3),
-                             "score": round(self.score, 2)})
+                             "score": round(self.score, 2), "voted": voting})
         if self.decision is None and self.votes >= self.min_votes and abs(self.score) >= self.threshold:
             self.decision = "right" if self.score > 0 else "left"
             self.decided_at = {"frame": frame, "d_ahead_m": None if d_ahead is None else round(d_ahead, 1),
@@ -108,3 +112,13 @@ class SwitchVoter:
             return None
         ok = [(v["p_right"] > 0.5) == (truth == "right") for v in h]
         return round(sum(ok) / len(ok), 3)
+
+    def accuracy_by_width(self, truth):
+        out = {}
+        for name, lo, hi in (("60-100px", 60, 100), ("100-200px", 100, 200), (">=200px", 200, 1e9)):
+            h = [v for v in self.history if lo <= v["box_w"] < hi]
+            if h:
+                ok = sum((v["p_right"] > 0.5) == (truth == "right") for v in h)
+                out[name] = {"accuracy": round(ok / len(h), 3), "frames": len(h)}
+        return out
+
