@@ -1,6 +1,15 @@
 # Prints the full path of blender.exe, or nothing. Used by run_sim.bat.
 $ErrorActionPreference = 'SilentlyContinue'
-function Done($p) { if ($p -and (Test-Path $p)) { Write-Output (Resolve-Path $p).Path; exit 0 } }
+# Store installs live in a protected WindowsApps package folder whose exe cannot be started
+# directly ("Access is denied"); only their execution alias in %LOCALAPPDATA% works.
+function Done($p) {
+  if ($p -and (Test-Path $p) -and ($p -notmatch '\\WindowsApps\\[^\\]*Blender')) {
+    Write-Output (Resolve-Path $p).Path; exit 0
+  }
+}
+
+# 0. Store execution alias, if enabled
+foreach ($a in (Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WindowsApps" -Filter 'blender*.exe')) { Done $a.FullName }
 
 # 1. on PATH
 Done (Get-Command blender.exe).Source
@@ -24,9 +33,7 @@ foreach ($e in (Get-ItemProperty $keys | Where-Object { $_.DisplayName -like '*B
   if ($e.DisplayIcon -match '([^",]*blender\.exe)') { Done $Matches[1] }
 }
 
-# 4. Microsoft Store app
-$pkg = Get-AppxPackage -Name '*Blender*' | Select-Object -First 1
-if ($pkg) { Done (Join-Path $pkg.InstallLocation 'Blender\blender.exe'); Done (Join-Path $pkg.InstallLocation 'blender.exe') }
+# 4. (Microsoft Store package folders are skipped: not launchable from scripts)
 
 # 5. search the usual places and every drive's top levels
 $roots = @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:LOCALAPPDATA\Programs", "$env:USERPROFILE\Downloads",

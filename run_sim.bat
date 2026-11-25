@@ -22,12 +22,16 @@ REM     association, installed programs, Microsoft Store, Steam, common folders,
 if not exist logs mkdir logs
 if not defined BLENDER if exist logs\blender_path.txt set /p BLENDER=<logs\blender_path.txt
 if defined BLENDER if not exist "%BLENDER%" set BLENDER=
+if defined BLENDER echo "%BLENDER%" | findstr /i /c:"\WindowsApps\BlenderFoundation" >nul && set BLENDER=
 if not defined BLENDER (
   echo Looking for Blender ...
   for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -File sim\find_blender.ps1`) do set "BLENDER=%%B"
 )
 if not defined BLENDER (
-  echo Blender was not found automatically.
+  echo No Blender that can be started from a script was found.
+  echo The Microsoft Store version cannot be started by scripts. Either:
+  echo   - Settings ^> Apps ^> Advanced app settings ^> App execution aliases: turn on Blender, or
+  echo   - download the Windows "Portable (.zip)" from https://www.blender.org/download/ and extract it
   echo Find blender.exe ^(right-click the Blender shortcut, Open file location^), then run:
   echo     set BLENDER=C:\path\to\blender.exe
   echo     run_sim.bat
