@@ -87,6 +87,8 @@ for %%S in (%SCENARIOS%) do (
   if "!TEP!"=="1" (
     echo --- same drive with TEP-Net's ego path ---
     python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
+    echo --- TEP-Net + path lock ---
+    python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --tag teplock !YOLO_ARGS!
   )
 )
 

@@ -11,6 +11,8 @@
 --ego tep --tep-weights tep_weights
          take the ego path from TEP-Net (regression model from train-ego-path-detection)
          instead of the segmentation's ego-track class; everything else stays the same
+--lock   (with --ego tep) path lock: keep the committed branch through a switch zone when the
+         model briefly flips to the other branch; objects on the rejected branch become advisories
 --tag    suffix for the output files, e.g. --tag tep -> collision_tep.mp4, summary_tep.json
 
 Writes into the run folder: collision.mp4 (frames with overlay + alert banner),
@@ -31,7 +33,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "sim"))
-from collision import (Params, State, analyse, decide, detections_from_boxes, draw_hud,  # noqa: E402
+from collision import (Params, PathLock, State, analyse, decide, detections_from_boxes, draw_hud,  # noqa: E402
                        path_cutoff, stop_distance)
 from infer import overlay, segment  # noqa: E402
 from railseg.checkpoint import load_trained  # noqa: E402
@@ -92,15 +94,32 @@ def load_tep(weights_root, device):
 
 
 def tep_ego(detector, img_bgr):
-    """Ego-path polygon (int32 Nx2) from TEP-Net, or None."""
+    """TEP-Net output: ("rails", [left_pts, right_pts]) for regression/classification models,
+    ("mask", bool array) for segmentation models, or (None, None)."""
     from PIL import Image
     res = detector.detect(Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)))
     if isinstance(res, list):
         if len(res) != 2 or len(res[0]) < 2 or len(res[1]) < 2:
-            return None
-        return np.array(res[0] + res[1][::-1], dtype=np.int32)
-    mask = np.array(res) > 0          # segmentation-head models return a mask
-    return mask if mask.any() else None
+            return None, None
+        return "rails", res
+    mask = np.array(res) > 0
+    return ("mask", mask) if mask.any() else (None, None)
+
+
+def paint_ego(label, ids, kind, data):
+    """Replace the ego-track pixels of a label map with an externally predicted ego path."""
+    ego_id = ids["ego-track"]
+    label[label == ego_id] = ids.get("track", ids.get("background", 0))
+    if kind is None:
+        return label
+    keep = (label == ids.get("on-rails", -1)) | (label == ids.get("human", -1))   # objects stay on top
+    if kind == "mask":
+        label[data & ~keep] = ego_id
+    else:
+        m = np.zeros(label.shape, np.uint8)
+        cv2.fillPoly(m, [np.array(list(data[0]) + list(data[1])[::-1], dtype=np.int32)], 1)
+        label[(m > 0) & ~keep] = ego_id
+    return label
 
 
 def fmt(v):
@@ -120,6 +139,8 @@ def main():
     ap.add_argument("--speed", type=float, default=None, help="m/s, if meta.json has none")
     ap.add_argument("--ego", choices=["seg", "tep"], default="seg", help="where the ego path comes from")
     ap.add_argument("--tep-weights", default="tep_weights")
+    ap.add_argument("--lock", action="store_true", help="path lock through switch zones (with --ego tep)")
+    ap.add_argument("--lock-hold-m", type=float, default=25.0, help="longest hold, metres of travel")
     ap.add_argument("--tag", default="", help="suffix for output file names")
     args = ap.parse_args()
     sfx = f"_{args.tag}" if args.tag else ""
@@ -149,6 +170,9 @@ def main():
     skip = ids.get("background")
     yolos = load_yolo(args.yolo)
     tep = load_tep(args.tep_weights, device) if args.ego == "tep" else None
+    step_m = speed / fps if fps else 1.0
+    lock = PathLock(max_hold=max(1, int(round(args.lock_hold_m / max(step_m, 1e-3))))) if (tep and args.lock) else None
+    held_frames = 0
     print(f"Scenario: {meta.get('obstacle', {}).get('scenario', '?')} | expected: {meta.get('expected', '?')}")
     print(f"Device: {device} | speed {speed} m/s | distance from {args.distance} | "
           f"cut-off cue {'off' if args.no_cutoff else 'on'} | YOLO models: {len(yolos)} | ego path: {args.ego}")
@@ -191,24 +215,28 @@ def main():
             label = segment(model, img, device)
             if device.type == "cuda":
                 torch.cuda.synchronize()
+            lock_status, alt_label = None, None
             if tep is not None:
-                ego_id = ids["ego-track"]
-                label[label == ego_id] = ids.get("track", ids.get("background", 0))
-                poly = tep_ego(tep, img)
-                if isinstance(poly, np.ndarray) and poly.dtype == bool:
-                    label[poly & (label != ids.get("on-rails", -1)) & (label != ids.get("human", -1))] = ego_id
-                elif poly is not None:
-                    m = np.zeros(label.shape, np.uint8)
-                    cv2.fillPoly(m, [poly], 1)
-                    keep = (label == ids.get("on-rails", -1)) | (label == ids.get("human", -1))
-                    label[(m > 0) & ~keep] = ego_id   # objects stay on top of the path
+                kind, data = tep_ego(tep, img)
+                if lock is not None and kind != "mask":
+                    used, lock_status = lock.update(data, i)
+                    if lock_status == "held":
+                        held_frames += 1
+                        alt_label = paint_ego(label.copy(), ids, "rails", lock.alt_rails)
+                    kind, data = ("rails", used) if used is not None else (None, None)
+                label = paint_ego(label, ids, kind, data)
             if device.type == "cuda":
                 torch.cuda.synchronize()
             model_ms = (time.perf_counter() - t0) * 1000
             dets, rows, fit = analyse(label, ids, p)
             if yolos:
                 dets += detections_from_boxes(yolo_boxes(yolos, img, device, args.yolo_conf), rows, fit, p)
-            if not args.no_cutoff:
+            if alt_label is not None:  # objects on the branch the lock rejected: advisory only
+                for d in analyse(alt_label, ids, p)[0]:
+                    if d.in_path:
+                        d.advisory, d.source, d.cls = True, "alt", f"{d.cls} (other branch)"
+                        dets.append(d)
+            if not args.no_cutoff and lock_status != "held":
                 cut = path_cutoff(rows, fit, state, i / fps, speed, p)
                 if cut is not None:
                     dets.append(cut)
@@ -220,6 +248,9 @@ def main():
             if not in_route and true_d is not None:
                 cv2.putText(vis, f"vehicle {true_d:.0f} m away, NOT on the train's route",
                             (430, 92), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            if lock_status == "held":
+                cv2.putText(vis, "PATH LOCK: holding committed branch", (30, 160),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
             cv2.putText(vis, f"model {model_ms:.0f} ms", (30, vis.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:
@@ -280,7 +311,9 @@ def main():
         bad = summary["frames_per_level"]["WARNING"] + summary["frames_per_level"]["BRAKE"]
         summary["verdict"] = ("PASS: no false alarm" if bad == 0 else
                               f"FAIL: false alarm on {bad} frames (vehicle is not on the train's route)")
-    summary["ego_source"] = args.ego
+    summary["ego_source"] = args.ego + (" + path lock" if lock else "")
+    if lock:
+        summary["path_lock"] = {"held_frames": held_frames, "releases": lock.events}
     (run / f"summary{sfx}.json").write_text(json.dumps(summary, indent=1))
     print("\nSummary:\n" + json.dumps(summary, indent=1))
     print(f"\nVideo: {run / f'collision{sfx}.mp4'}")

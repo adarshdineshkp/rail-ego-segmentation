@@ -59,6 +59,7 @@ class Detection:
     dist_gauge: float = float("nan")
     dist_ground: float = float("nan")
     source: str = "seg"
+    advisory: bool = False          # e.g. on the branch the path lock rejected: at most TRACKING
 
 
 @dataclass
@@ -219,7 +220,8 @@ def decide(dets, speed_mps, state, p):
             v = d.dist_ground if p.distance_source == "gauge" else d.dist_gauge
         return v if math.isfinite(v) else 1e9
 
-    in_path = [d for d in dets if d.in_path]
+    advisories = [d for d in dets if d.in_path and d.advisory]
+    in_path = [d for d in dets if d.in_path and not d.advisory]
     near = min(in_path, key=dist_of, default=None)
     if state.hist.maxlen != p.persist_n:
         state.hist = deque(state.hist, maxlen=p.persist_n)
@@ -235,6 +237,11 @@ def decide(dets, speed_mps, state, p):
     ttc = dist / speed_mps if speed_mps > 0 and math.isfinite(dist) else float("inf")
     if not confirmed or near is None:
         level = "CLEAR"
+        if advisories:  # something on the other branch while the path lock holds: inform, don't brake
+            near = min(advisories, key=dist_of)
+            dist = dist_of(near)
+            ttc = dist / speed_mps if speed_mps > 0 else float("inf")
+            level = "TRACKING"
     elif dist <= p.brake_factor * stop:
         level = "BRAKE"
     elif dist <= p.warn_factor * stop:
@@ -245,7 +252,7 @@ def decide(dets, speed_mps, state, p):
 
 
 COLORS = {"CLEAR": (60, 170, 60), "TRACKING": (200, 150, 40), "WARNING": (0, 165, 255), "BRAKE": (0, 0, 230)}
-SRC_COLORS = {"seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255)}
+SRC_COLORS = {"seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255), "alt": (255, 200, 0)}
 
 
 def draw_hud(img, level, near, dist, ttc, stop, speed, true_dist=None, dets=()):
@@ -267,3 +274,84 @@ def draw_hud(img, level, near, dist, ttc, stop, speed, true_dist=None, dets=()):
         cv2.putText(img, f"true distance {true_dist:.0f} m{err}", (430, 92),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
     return img
+
+
+class PathLock:
+    """Keeps a committed ego path through switch zones.
+
+    A frame-by-frame ego-path model can flip to the other branch for a few frames right at a
+    switch, when the blades are out of view and both branches continue the rails under the train.
+    The lock compares each new path with the committed one by their centre lines (far part = rows
+    where the track looks narrow, i.e. far away):
+      - far part agrees with the committed path        -> accept, path stays committed
+      - far part differs, path was committed           -> HOLD the committed path, at most
+                                                          max_hold frames (the switch zone length)
+      - while holding, a path closer to the committed
+        one than to the rejected one                    -> resume (the flip is over)
+      - hold limit reached                              -> RELEASE: accept the new path
+    The image alone cannot tell a brief flip from the train really taking the other branch (the
+    track under the camera looks the same either way), so the hold is bounded; the route itself
+    should come from RTK + track map. Paths are (left_rail, right_rail) lists of (x, y) points."""
+
+    def __init__(self, commit_frames=15, far_tol=0.5, max_hold=25):
+        self.commit_frames, self.far_tol, self.max_hold = commit_frames, far_tol, max_hold
+        self.ref = self.ref_rails = self.alt = None
+        self.stable, self.held, self.events = 0, 0, []
+
+    @staticmethod
+    def _centre(rails):
+        l, r = np.asarray(rails[0], float), np.asarray(rails[1], float)
+        n = min(len(l), len(r))
+        if n < 4:
+            return None
+        l, r = l[:n], r[:n]
+        y = (l[:, 1] + r[:, 1]) / 2
+        order = np.argsort(y)
+        return y[order], ((l[:, 0] + r[:, 0]) / 2)[order], np.abs(r[:, 0] - l[:, 0])[order]
+
+    @staticmethod
+    def far_diff(a, b):
+        """Median centre-line difference, in track widths, over the far rows both paths cover."""
+        ya, xa, _ = a
+        yb, xb, wb = b
+        lo, hi = max(ya[0], yb[0]), min(ya[-1], yb[-1])
+        if hi - lo < 10:
+            return float("inf")
+        ys = np.linspace(lo, hi, 96)
+        w = np.maximum(np.interp(ys, yb, wb), 2.0)
+        far = w <= 0.3 * w.max()   # perspective: split by apparent width, not by row count
+        if not far.any():
+            return float("inf")
+        dx = np.abs(np.interp(ys, ya, xa) - np.interp(ys, yb, xb))
+        return float(np.median((dx / w)[far]))
+
+    def update(self, rails, frame=None):
+        """Returns (rails to use, status): free / stable / held / released.
+        While held, `alt_rails` is the rejected path (for advisory checks)."""
+        self.alt_rails = None
+        new = self._centre(rails) if rails is not None else None
+        if new is None:
+            return (self.ref_rails if self.held and self.held < self.max_hold else None), "free"
+        if self.ref is None:
+            self._accept(rails, new)
+            return rails, "free"
+        d_ref = self.far_diff(new, self.ref)
+        if d_ref <= self.far_tol or (self.held and self.alt is not None and d_ref < self.far_diff(new, self.alt)):
+            self._accept(rails, new)
+            self.stable += 1
+            return rails, "stable"
+        if self.stable >= self.commit_frames and self.held < self.max_hold:
+            self.held += 1
+            if self.alt is None:
+                self.alt = new
+            self.alt_rails = rails
+            return self.ref_rails, "held"
+        status = "released" if self.stable >= self.commit_frames else "free"
+        if status == "released":
+            self.events.append({"frame": frame, "held_frames": self.held})
+        self._accept(rails, new)
+        self.stable = 0
+        return rails, status
+
+    def _accept(self, rails, centre):
+        self.ref, self.ref_rails, self.held, self.alt = centre, rails, 0, None

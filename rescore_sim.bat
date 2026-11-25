@@ -29,6 +29,8 @@ for %%R in (%RUNS%) do (
     if exist tep_weights (
       echo --- same drive with TEP-Net's ego path ---
       python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --tag tep !YOLO_ARGS!
+      echo --- TEP-Net + path lock ---
+      python sim\run_collision.py --run "sim_out\%%R" --ckpt "%CKPT%" --show --ego tep --tep-weights tep_weights --lock --tag teplock !YOLO_ARGS!
     )
   ) else (
     echo %%R: rendering not finished ^(no done.txt^), skipped
