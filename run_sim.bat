@@ -22,7 +22,7 @@ REM     association, installed programs, Microsoft Store, Steam, common folders,
 if not exist logs mkdir logs
 if not defined BLENDER if exist logs\blender_path.txt set /p BLENDER=<logs\blender_path.txt
 if defined BLENDER if not exist "%BLENDER%" set BLENDER=
-if defined BLENDER echo "%BLENDER%" | findstr /i /c:"\WindowsApps\BlenderFoundation" >nul && set BLENDER=
+if defined BLENDER echo "%BLENDER%" | findstr /i /l /c:"BlenderFoundation.Blender_" >nul && set BLENDER=
 if not defined BLENDER (
   echo Looking for Blender ...
   for /f "usebackq delims=" %%B in (`powershell -NoProfile -ExecutionPolicy Bypass -File sim\find_blender.ps1`) do set "BLENDER=%%B"

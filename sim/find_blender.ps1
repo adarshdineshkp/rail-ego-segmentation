@@ -3,7 +3,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # Store installs live in a protected WindowsApps package folder whose exe cannot be started
 # directly ("Access is denied"); only their execution alias in %LOCALAPPDATA% works.
 function Done($p) {
-  if ($p -and (Test-Path $p) -and ($p -notmatch '\\WindowsApps\\[^\\]*Blender')) {
+  if ($p -and (Test-Path $p) -and ($p -notmatch 'WindowsApps\\BlenderFoundation\.Blender_')) {
     Write-Output (Resolve-Path $p).Path; exit 0
   }
 }
