@@ -1,27 +1,29 @@
 @echo off
-REM Simulated drive: Blender renders a railway scene from a cab camera, and the collision
-REM warning runs live on each frame as it is rendered.
-REM   run_sim.bat                    vehicle on the track in a curve, 36 km/h
-REM   run_sim.bat person             person standing on the track
-REM   run_sim.bat vehicle 15         same, at 15 m/s (54 km/h)
-REM Results: sim_out\<scenario>\collision.mp4, collision_log.csv, summary.json
-setlocal
+REM Simulated drives: Blender renders a railway scene from a cab camera, and the collision
+REM warning runs live on each frame as it is rendered. Ends with a scoreboard.
+REM   run_sim.bat                         all four scenarios at 36 km/h
+REM   run_sim.bat switch_clear            one scenario: vehicle, person, switch_blocked, switch_clear
+REM   run_sim.bat all 15                  all scenarios at 15 m/s (54 km/h)
+REM Your own YOLO models: put the .pt files in a "yolo" folder next to this script
+REM (and pip install ultralytics); they are then used alongside the segmentation.
+REM Results: sim_out\<scenario>_<speed>\collision.mp4, collision_log.csv, summary.json
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 call .venv\Scripts\activate.bat || (echo Run setup_windows.bat first. & pause & exit /b 1)
 
-set SCEN=%~1
-if "%SCEN%"=="" set SCEN=vehicle
+set SCENARIOS=%~1
+if "%SCENARIOS%"=="" set SCENARIOS=all
+if /i "%SCENARIOS%"=="all" set SCENARIOS=vehicle person switch_blocked switch_clear
 set SPEED=%~2
 if "%SPEED%"=="" set SPEED=10
-set RUN=sim_out\%SCEN%_%SPEED%
 set CKPT=runs\rs19ego_pidnet_s_b4\best.pt
 if not exist "%CKPT%" (echo Checkpoint %CKPT% not found. & pause & exit /b 1)
 
 REM --- find Blender: BLENDER variable, remembered path, or a search (PATH, .blend file
-REM     association, installed programs, Microsoft Store, Steam, common folders, all drives)
+REM     association, installed programs, Store execution alias, common folders, all drives)
 if not exist logs mkdir logs
 if not defined BLENDER if exist logs\blender_path.txt set /p BLENDER=<logs\blender_path.txt
-if defined BLENDER if not exist "%BLENDER%" set BLENDER=
+if defined BLENDER if not exist "!BLENDER!" set BLENDER=
 if defined BLENDER echo "%BLENDER%" | findstr /i /l /c:"BlenderFoundation.Blender_" >nul && set BLENDER=
 if not defined BLENDER (
   echo Looking for Blender ...
@@ -32,24 +34,38 @@ if not defined BLENDER (
   echo The Microsoft Store version cannot be started by scripts. Either:
   echo   - Settings ^> Apps ^> Advanced app settings ^> App execution aliases: turn on Blender, or
   echo   - download the Windows "Portable (.zip)" from https://www.blender.org/download/ and extract it
-  echo Find blender.exe ^(right-click the Blender shortcut, Open file location^), then run:
-  echo     set BLENDER=C:\path\to\blender.exe
-  echo     run_sim.bat
-  echo or paste that path into logs\blender_path.txt
+  echo Or set the path yourself:  set BLENDER=C:\path\to\blender.exe  then run this again.
   pause
   exit /b 1
 )
-> logs\blender_path.txt echo %BLENDER%
-echo Blender: %BLENDER%
+> logs\blender_path.txt echo !BLENDER!
+echo Blender: !BLENDER!
 
-if exist "%RUN%" rmdir /s /q "%RUN%"
-mkdir "%RUN%"
+REM --- optional YOLO models
+set YOLO_ARGS=
+if exist yolo\*.pt (
+  python -c "import ultralytics" 2>nul
+  if errorlevel 1 (
+    echo Found yolo\*.pt but the ultralytics package is missing - running without YOLO.
+    echo To use them:  .venv\Scripts\pip install ultralytics
+  ) else (
+    set YOLO_ARGS=--yolo
+    for %%W in (yolo\*.pt) do set YOLO_ARGS=!YOLO_ARGS! "%%W"
+    echo YOLO models: !YOLO_ARGS!
+  )
+)
 
-echo Starting the render in a second window ...
-start "Blender render - %SCEN%" cmd /c ""%BLENDER%" -b --factory-startup --python sim\build_scene.py -- --out "%RUN%" --scenario %SCEN% --speed %SPEED% > logs\blender_%SCEN%_%SPEED%.log 2>&1"
+for %%S in (%SCENARIOS%) do (
+  set RUN=sim_out\%%S_%SPEED%
+  echo.
+  echo ==================== %%S at %SPEED% m/s ====================
+  if exist "!RUN!" rmdir /s /q "!RUN!"
+  mkdir "!RUN!"
+  start "Blender render - %%S" /min cmd /c ""!BLENDER!" -b --factory-startup --python sim\build_scene.py -- --out "!RUN!" --scenario %%S --speed %SPEED% > logs\blender_%%S_%SPEED%.log 2>&1"
+  python sim\run_collision.py --run "!RUN!" --ckpt "%CKPT%" --watch --show !YOLO_ARGS!
+)
 
-echo Collision warning, live (q or Esc in the window to stop) ...
-python sim\run_collision.py --run "%RUN%" --ckpt "%CKPT%" --watch --show
+python sim\summarize.py sim_out
 echo.
-echo Video and log: %~dp0%RUN%   (Blender log: logs\blender_%SCEN%_%SPEED%.log)
+echo Videos and logs are in %~dp0sim_out
 pause

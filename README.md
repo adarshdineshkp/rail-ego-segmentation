@@ -93,11 +93,19 @@ tools/                               prepare split, download weights, smoke test
 
 ## Simulated drive (Blender)
 
-`run_sim.bat` (or `blender -b --factory-startup --python sim/build_scene.py -- --out sim_out/run1`
-followed by `python sim/run_collision.py --run sim_out/run1 --ckpt <best.pt> --show`) renders a
-procedural railway scene from a cab camera, with a vehicle or a person standing on the track in a
-curve, and runs the collision warning on every frame as it is rendered. `sim/collision.py` holds the
-logic: ego corridor at clearance width, in-path test, distance from the track gauge and from the
-ground plane, k-of-n persistence, and braking-distance alert levels. Each run writes
-`collision.mp4`, `collision_log.csv` and `summary.json` (when each alert fired vs the true distance,
-and whether braking would have been in time).
+`run_sim.bat` renders procedural railway drives in Blender and runs the camera-only collision
+warning live on every frame, then prints a scoreboard (`sim/summarize.py`). Scenarios:
+
+| scenario | situation | correct outcome |
+|---|---|---|
+| `vehicle` | rail vehicle standing on the ego track in a curve | BRAKE before the braking distance |
+| `person` | person standing between the ego rails | BRAKE before the braking distance |
+| `switch_blocked` | facing switch set straight, vehicle on the straight track beyond it | BRAKE in time |
+| `switch_clear` | same switch set to the diverging track, vehicle on the straight track | no WARNING / BRAKE |
+
+`sim/collision.py` holds the logic: ego corridor at clearance width, in-path test for segmented
+objects and (optionally) your YOLO boxes (`yolo/*.pt`, needs `pip install ultralytics`), a
+class-agnostic **path cut-off** cue (the visible end of the ego-track approaching at train speed =
+something static on the track), distance from a fitted track-gauge model and from the ground
+plane, k-of-n persistence, and braking-distance alert levels. Each run writes `collision.mp4`,
+`collision_log.csv` and `summary.json` with a PASS/FAIL verdict.
