@@ -43,7 +43,7 @@ import torch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "sim"))
-from collision import (Detection, Params, PathLock, State, analyse, decide, detections_from_boxes, draw_hud,  # noqa: E402
+from collision import (Detection, Params, PathLock, State, analyse, decide, route_gate, detections_from_boxes, draw_hud,  # noqa: E402
                        path_cutoff, stop_distance)
 from infer import overlay, segment  # noqa: E402
 from railseg.checkpoint import load_trained  # noqa: E402
@@ -273,6 +273,8 @@ def main():
         + (" + path lock" if lock else "") + (" + route plan" if plan else "") \
         + (" + switch state (camera)" if args.switch_cls and lock else "")
     false_frames, alert_on, conflict_first = 0, {}, None
+    turnout = meta.get("turnout") or {"radius_m": 190.0, "angle_rad": math.atan(1 / 9),
+                                      "crossover_spacing_m": 5.0 if sc_name == "crossover" else None}
     win = f"collision ({args.ego} ego path)"
     if args.show:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
@@ -358,6 +360,9 @@ def main():
                     if d.in_path:
                         d.advisory, d.source, d.cls = True, "alt", f"{d.cls} (other branch)"
                         dets.append(d)
+            if prefer is not None and d_ahead is not None and d_ahead > 0:
+                side = meta.get("turnout_side", "right")
+                route_gate(dets, rows, d_ahead, prefer == side, side, turnout, p)
             if not args.no_cutoff and lock_status != "held":
                 cut = path_cutoff(rows, fit, state, i / fps, speed, p)
                 if cut is not None:

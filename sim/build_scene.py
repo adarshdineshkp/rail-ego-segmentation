@@ -620,6 +620,8 @@ meta = {
     "turnout_side": "right" if SWITCH else None,
     "switch_setting": ("right" if ROUTE_DIVERGE else "left") if SWITCH else None,
     "planned_branch": PLANNED,
+    "turnout": {"radius_m": R_TURNOUT, "angle_rad": TURNOUT_ANGLE,
+                "crossover_spacing_m": XO_SPACING if CROSSOVER else None} if SWITCH else None,
     "scenario": SCEN, "obstacles": obstacles,
 }
 with open(os.path.join(OUT, "meta.json"), "w") as fh:

@@ -48,6 +48,9 @@ class Params:
     cutoff_window: int = 20         # frames used to measure how fast the path end approaches
     cutoff_min_ratio: float = 0.6   # closing speed must be >= this fraction of train speed
     cutoff_min_rows: float = 5.0    # resolution guard, see path_cutoff
+    near_face_m: float = 1.2        # in-path test uses the object's columns whose lowest pixel is within
+                                    # this height of its lowest point: catches body overhangs (a vehicle
+                                    # whose wheels are on another track but whose body fouls the clearance)
 
 
 @dataclass
@@ -60,6 +63,7 @@ class Detection:
     dist_ground: float = float("nan")
     source: str = "seg"
     advisory: bool = False          # e.g. on the branch the path lock rejected: at most TRACKING
+    foot: tuple = None              # (x0, x1) image columns of the object's near end, at row bottom_y
 
 
 @dataclass
@@ -153,11 +157,19 @@ def analyse(label, class_ids, p):
             if area < p.min_area_px:
                 continue
             yb = int(y + h - 1)
-            band = cc[max(yb - 3, y): yb + 1, x: x + w] == i   # the object's footprint
-            cols = np.flatnonzero(band.any(axis=0)) + x
+            dg, dgr = gauge_distance(fit, yb, p), ground_distance(yb, p)
+            d = dg if math.isfinite(dg) else dgr
+            # near end of the object: columns whose lowest pixel lies within near_face_m (at the
+            # object's distance) of its lowest point -> wheels AND the body edge above them
+            tol = int(round(p.near_face_m * p.f_px / d)) if math.isfinite(d) and d > 1 else 3
+            sub = cc[y: yb + 1, x: x + w] == i
+            has = sub.any(axis=0)
+            lowest = (sub.shape[0] - 1 - np.argmax(sub[::-1], axis=0)) + y
+            cols = np.flatnonzero(has & (lowest >= yb - max(tol, 3))) + x
             in_path = cols.size > 0 and _in_corridor(rows, top_y, cols.min(), cols.max(), yb, p)
+            foot = (int(cols.min()), int(cols.max())) if cols.size else None
             dets.append(Detection(cname, (int(x), int(y), int(x + w), int(y + h)), yb, bool(in_path),
-                                  gauge_distance(fit, yb, p), ground_distance(yb, p), "seg"))
+                                  dg, dgr, "seg", foot=foot))
     return dets, rows, fit
 
 
@@ -170,7 +182,8 @@ def detections_from_boxes(boxes, rows, fit, p, source="yolo"):
         inset = 0.25 * (x1 - x0)  # use the middle of the box bottom as the footprint
         in_path = _in_corridor(rows, top_y, x0 + inset, x1 - inset, yb, p)
         out.append(Detection(f"{name} {score:.2f}", (int(x0), int(y0), int(x1), int(y1)), yb, bool(in_path),
-                             gauge_distance(fit, yb, p), ground_distance(yb, p), source))
+                             gauge_distance(fit, yb, p), ground_distance(yb, p), source,
+                             foot=(int(x0 + inset), int(x1 - inset))))
     return out
 
 
@@ -252,7 +265,7 @@ def decide(dets, speed_mps, state, p):
 
 
 COLORS = {"CLEAR": (60, 170, 60), "TRACKING": (200, 150, 40), "WARNING": (0, 165, 255), "BRAKE": (0, 0, 230)}
-SRC_COLORS = {"seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255), "alt": (255, 200, 0), "switch": (255, 0, 255)}
+SRC_COLORS = {"route": (255, 200, 0), "seg": (0, 0, 255), "yolo": (255, 0, 255), "cutoff": (0, 255, 255), "alt": (255, 200, 0), "switch": (255, 0, 255)}
 
 
 def draw_hud(img, level, near, dist, ttc, stop, speed, true_dist=None, dets=()):
@@ -386,3 +399,59 @@ class PathLock:
 
     def _accept(self, rails, centre):
         self.ref, self.ref_rails, self.held, self.alt = centre, rails, 0, None
+
+
+def branch_lateral(u, turnout):
+    """Lateral offset (m) of the diverging route's centre u metres past the toe (from the map):
+    curve of radius R through the turnout angle, then straight - or, for a crossover, a reverse
+    curve back to a parallel track `crossover_spacing_m` away."""
+    R, a = turnout.get("radius_m", 190.0), turnout.get("angle_rad", math.atan(1 / 9))
+    uc = R * a
+    if u <= 0:
+        return 0.0
+    if u <= uc:
+        return R * (1 - math.cos(u / R))
+    off = R * (1 - math.cos(a))
+    sp = turnout.get("crossover_spacing_m")
+    if not sp:
+        return off + (u - uc) * math.sin(a)
+    straight = (sp - 2 * off) / math.sin(a)
+    if u <= uc + straight:
+        return off + (u - uc) * math.sin(a)
+    if u <= 2 * uc + straight:
+        phi = (u - uc - straight) / R            # reverse curve: heading a -> 0
+        return sp - R * (1 - math.cos(a - phi))
+    return sp
+
+
+def route_gate(dets, rows, d_ahead, diverge, side, turnout, p, margin_m=0.5):
+    """Before a facing switch whose route is known (plan / switch vote), mark objects beyond the
+    toe that are clear of the route's clearance envelope as advisories (e.g. a vehicle on the
+    straight track when the route diverges). Lateral positions are measured from the straight
+    track's centre line, extrapolated from the ego path in front of the switch."""
+    if not rows or d_ahead is None or d_ahead <= 0:
+        return
+    toe_y = p.cy + p.f_px * (p.cam_height_m / d_ahead - math.tan(math.radians(p.pitch_deg)))
+    ys = np.array([y for y in rows if y > toe_y + 5], dtype=np.float64)
+    if len(ys) >= 10:
+        xc = np.array([(rows[int(y)][0] + rows[int(y)][1]) / 2 for y in ys])
+        k, c0 = np.polyfit(ys, xc, 1)
+    else:
+        k, c0 = 0.0, (max(r[1] for r in rows.values()) + min(r[0] for r in rows.values())) / 2
+    sgn = 1.0 if side == "right" else -1.0
+    for d in dets:
+        if not d.in_path or d.advisory or d.source in ("switch", "cutoff"):
+            continue
+        dist = d.dist_gauge if math.isfinite(d.dist_gauge) else d.dist_ground
+        if not math.isfinite(dist) or dist <= d_ahead + 3.0:
+            continue
+        ppm = p.f_px / dist
+        xs = k * d.bottom_y + c0
+        x0, x1 = d.foot if d.foot else (d.bbox[0], d.bbox[2])
+        l0, l1 = (x0 - xs) / ppm, (x1 - xs) / ppm                 # lateral, + = right
+        c = sgn * branch_lateral(dist - d_ahead, turnout) if diverge else 0.0
+        gap = 0.0 if l0 <= c <= l1 else min(abs(l0 - c), abs(l1 - c))
+        if gap > p.envelope_m / 2 + margin_m:
+            d.advisory, d.source = True, "route"
+            d.cls += " (beyond switch, not on route)"
+
