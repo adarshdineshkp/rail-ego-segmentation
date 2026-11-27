@@ -23,6 +23,11 @@
          takes the planned branch. With --switch-cls too, a switch that the camera reads as set
          AGAINST the plan raises a "switch set against route" alert, and the lock follows the
          branch the switch is really set for
+--no-zoom
+         skip the zoomed second pass: by default the segmentation also runs on the far part of
+         the image (half-size window around the far end of the ego path, upscaled 2x) and its
+         vehicles / people are merged in - objects are recognised about twice as far away, at
+         about twice the model time
 --tag    suffix for the output files, e.g. --tag tep -> collision_tep.mp4, summary_tep.json
 
 Writes into the run folder: collision.mp4 (frames with overlay + alert banner),
@@ -169,6 +174,21 @@ def draw_scenario(vis, meta, pass_name, obs_dist=None):
                     (0, 255, 255) if k == 0 else (255, 255, 255), 2)
 
 
+def zoom_objects(model, img, device, centre, obj_ids):
+    """Segment a half-size window around `centre` (x, y) at 2x scale and return a full-size label
+    map holding only its object classes (255 elsewhere)."""
+    h, w = img.shape[:2]
+    cw, ch = w // 2, h // 2
+    x0 = int(min(max(centre[0] - cw / 2, 0), w - cw))
+    y0 = int(min(max(centre[1] - ch / 2, 0), h - ch))
+    crop = cv2.resize(img[y0:y0 + ch, x0:x0 + cw], (w, h), interpolation=cv2.INTER_LINEAR)
+    zl = cv2.resize(segment(model, crop, device), (cw, ch), interpolation=cv2.INTER_NEAREST)
+    out = np.full((h, w), 255, np.uint8)
+    keep = np.isin(zl, obj_ids)
+    out[y0:y0 + ch, x0:x0 + cw][keep] = zl[keep]
+    return out, (x0, y0, x0 + cw, y0 + ch)
+
+
 def obstacles_of(meta):
     obs = meta.get("obstacles")
     if obs:
@@ -209,6 +229,7 @@ def main():
     ap.add_argument("--tep-weights", default="tep_weights")
     ap.add_argument("--lock", action="store_true", help="path lock through switch zones (with --ego tep)")
     ap.add_argument("--lock-hold-m", type=float, default=25.0, help="longest hold, metres of travel")
+    ap.add_argument("--no-zoom", action="store_true", help="no zoomed far-range segmentation pass")
     ap.add_argument("--route-plan", action="store_true", help="use the planned route through the switch (with --lock)")
     ap.add_argument("--switch-cls", default=None, help="switch-state classifier checkpoint (with --lock)")
     ap.add_argument("--tag", default="", help="suffix for output file names")
@@ -226,7 +247,7 @@ def main():
     meta = json.loads((run / "meta.json").read_text())
     speed = args.speed or meta.get("speed_mps", 0.0)
     fps = meta.get("fps", 10)
-    p = Params(f_px=meta["f_px"], cy=meta["cy"], cam_height_m=meta.get("cam_height_above_rail_m", 3.0),
+    p = Params(f_px=meta["f_px"], cy=meta["cy"], cx=meta.get("cx", meta.get("width", 1920) / 2), cam_height_m=meta.get("cam_height_above_rail_m", 3.0),
                pitch_deg=meta.get("pitch_deg", 0.0), distance_source=args.distance)
     sc_name = meta.get("scenario") or meta.get("obstacle", {}).get("scenario")
     if meta.get("layout") == "switch" and not meta.get("planned_branch"):   # runs rendered before these fields
@@ -273,6 +294,9 @@ def main():
         + (" + path lock" if lock else "") + (" + route plan" if plan else "") \
         + (" + switch state (camera)" if args.switch_cls and lock else "")
     false_frames, alert_on, conflict_first = 0, {}, None
+    horizon = meta["cy"] - meta["f_px"] * math.tan(math.radians(meta.get("pitch_deg", 0.0)))
+    far_xy = (meta.get("width", 1920) / 2, horizon + 60)            # updated from the ego path each frame
+    obj_ids = [ids[c] for c in ("on-rails", "human", "obstacle") if c in ids]
     turnout = meta.get("turnout") or {"radius_m": 190.0, "angle_rad": math.atan(1 / 9),
                                       "crossover_spacing_m": 5.0 if sc_name == "crossover" else None}
     win = f"collision ({args.ego} ego path)"
@@ -316,6 +340,11 @@ def main():
 
             t0 = time.perf_counter()
             label = segment(model, img, device)
+            zoom_win = None
+            if not args.no_zoom:
+                zl, zoom_win = zoom_objects(model, img, device, far_xy, obj_ids)
+                m = zl != 255
+                label[m] = zl[m]
             if device.type == "cuda":
                 torch.cuda.synchronize()
             lock_status, alt_label = None, None
@@ -360,7 +389,7 @@ def main():
                     if d.in_path:
                         d.advisory, d.source, d.cls = True, "alt", f"{d.cls} (other branch)"
                         dets.append(d)
-            if prefer is not None and d_ahead is not None and d_ahead > 0:
+            if prefer is not None and d_ahead is not None and d_ahead > -30.0:
                 side = meta.get("turnout_side", "right")
                 route_gate(dets, rows, d_ahead, prefer == side, side, turnout, p)
             if not args.no_cutoff and lock_status != "held":
@@ -376,6 +405,9 @@ def main():
                     print(f"  frame {i}: SWITCH SET AGAINST ROUTE ({voter.decision}, plan {plan}), {d_ahead:.0f} m ahead")
                 b = tuple(int(v) for v in sw_box) if sw_box is not None else (900, 500, 1020, 560)
                 dets.append(Detection("switch set against route", b, b[3], True, d_ahead, d_ahead, "switch"))
+            if rows:                                                     # aim next frame's zoom window
+                ty = min(rows)
+                far_xy = ((rows[ty][0] + rows[ty][1]) / 2, min(ty, horizon + 120) + 60)
             level, near, dist, ttc, stop = decide(dets, speed, state, p)
             levels.append(level)
 
@@ -408,6 +440,8 @@ def main():
                 cv2.putText(vis, txt + f"  vote {voter.score:+.1f} ({voter.votes} frames)", (30, 210),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 255), 2)
             draw_scenario(vis, meta, pass_name, obs_dist)
+            if zoom_win is not None:
+                cv2.rectangle(vis, zoom_win[:2], zoom_win[2:], (180, 180, 180), 1)
             cv2.putText(vis, f"model {model_ms:.0f} ms", (30, vis.shape[0] - 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
             if writer is None:

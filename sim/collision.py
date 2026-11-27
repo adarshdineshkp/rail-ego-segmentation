@@ -31,6 +31,7 @@ LEVELS = ("CLEAR", "TRACKING", "WARNING", "BRAKE")
 class Params:
     f_px: float
     cy: float
+    cx: float = float("nan")       # optical centre column (image centre if unknown)
     cam_height_m: float = 3.0
     pitch_deg: float = 2.0
     gauge_m: float = 1.5           # width the ego-track mask spans (rail to rail)
@@ -429,7 +430,33 @@ def route_gate(dets, rows, d_ahead, diverge, side, turnout, p, margin_m=0.5):
     toe that are clear of the route's clearance envelope as advisories (e.g. a vehicle on the
     straight track when the route diverges). Lateral positions are measured from the straight
     track's centre line, extrapolated from the ego path in front of the switch."""
-    if not rows or d_ahead is None or d_ahead <= 0:
+    if not rows or d_ahead is None or d_ahead <= -30.0:
+        return
+    sgn = 1.0 if side == "right" else -1.0
+    if d_ahead <= 0:
+        # just past the toe: the camera is already on its route; place objects with the camera
+        # pose from the map (position along the route) instead of the ego path in front
+        u_c = -d_ahead
+        bc = sgn * branch_lateral(u_c, turnout) if diverge else 0.0
+        psi = math.atan(sgn * (branch_lateral(u_c + 0.5, turnout) - branch_lateral(u_c - 0.5, turnout))) \
+            if diverge else 0.0
+        cxo = p.cx if math.isfinite(p.cx) else None
+        for d in dets:
+            if not d.in_path or d.advisory or d.source in ("switch", "cutoff") or cxo is None:
+                continue
+            dist = d.dist_gauge if math.isfinite(d.dist_gauge) else d.dist_ground
+            if not math.isfinite(dist) or dist < 25.0:   # too close to the shared part of the switch
+                continue
+            ppm = p.f_px / dist
+            x0, x1 = d.foot if d.foot else (d.bbox[0], d.bbox[2])
+            lats = [bc + dist * math.sin(psi) + (x - cxo) / ppm * math.cos(psi) for x in (x0, x1)]
+            u_obj = u_c + dist * math.cos(psi)
+            c = sgn * branch_lateral(u_obj, turnout) if diverge else 0.0
+            l0, l1 = min(lats), max(lats)
+            gap = 0.0 if l0 <= c <= l1 else min(abs(l0 - c), abs(l1 - c))
+            if gap > p.envelope_m / 2 + margin_m:
+                d.advisory, d.source = True, "route"
+                d.cls += " (beyond switch, not on route)"
         return
     toe_y = p.cy + p.f_px * (p.cam_height_m / d_ahead - math.tan(math.radians(p.pitch_deg)))
     ys = np.array([y for y in rows if y > toe_y + 5], dtype=np.float64)
@@ -438,7 +465,6 @@ def route_gate(dets, rows, d_ahead, diverge, side, turnout, p, margin_m=0.5):
         k, c0 = np.polyfit(ys, xc, 1)
     else:
         k, c0 = 0.0, (max(r[1] for r in rows.values()) + min(r[0] for r in rows.values())) / 2
-    sgn = 1.0 if side == "right" else -1.0
     for d in dets:
         if not d.in_path or d.advisory or d.source in ("switch", "cutoff"):
             continue
